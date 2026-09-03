@@ -1,29 +1,38 @@
 """麦麦转发（github.cateye.mai-forward）。
 
-提供两个 LLM 工具：
+提供 LLM 工具：
 
 - forward_messages：把指定消息按原样打包，合并或逐条转发到目标聊天流；
-  发送成功后向目标聊天注入一条以 ``[转发工具 源→目标]`` 开头的聊天记录，
-  标明这条信息是从哪里转发来的。
-- repeat_message：把指定消息按原样复读到当前聊天，随后构造一条相同的信息
-  入库，开头额外显示 ``[复读工具]`` 字样。
+  发送成功后若目标为**群聊**，向目标群注入一条以 ``[转发工具 源→目标]``
+  开头的聊天记录，标明这条信息是从哪里转发来的；目标为**私聊**时只真发、不入库。
+- repeat_message：把指定消息按原样复读到当前聊天；在**群聊**中复读时构造
+  一条相同的信息入库，开头额外显示 ``[复读工具]`` 字样，在**私聊**中复读
+  时只真发、不入库。
+- pack_chat_messages：把 LLM 感兴趣的若干消息打包存入本地数据，每包有唯一
+  pack_id，并附 LLM 给出的内容概括/描述；供之后分享到其他群。
+- list_message_packs：列出本地数据中尚未销毁的打包记录（pack_id + 概括/描述
+  + 来源群 + 消息数），供 LLM 挑选要分享的包。
+- share_message_pack：把指定 pack_id 的打包内容作为合并转发发到**当前聊天**；
+  成功一次消耗一次机会，达到上限或开启「分享后销毁」后该包从本地数据删除。
 
 消息内容一律从 NapCat（get_msg 原始消息段，优先）或 MaiBot 宿主数据库读取，
 不使用 LLM 转述的文本构造转发节点，避免转发信息失真；若所有目标消息都能在
 NapCat 侧解析出平台消息 ID，优先用「引用节点 / 单条转发」让协议端直接使用
 原始消息，内容零改动。
 
-记录注入走 ``@MessageGateway`` + ``ctx.gateway.route_message`` 的
+群聊目标的记录注入走 ``@MessageGateway`` + ``ctx.gateway.route_message`` 的
 is_notify 合成通知通道（官方「只入库不真发」通道）：写入数据库、WebUI 可见，
 但不触发回复循环。
 """
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 from maibot_sdk import Field, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
@@ -37,6 +46,7 @@ _DAY_SECONDS = 86400.0
 _LINE_LIMIT = 400   # 聊天记录里单条消息摘要的最大长度
 _QUOTE_LIMIT = 80   # 回复引用摘要的最大长度
 _NAPCAT_COOLDOWN = 60.0  # NapCat 宿主级调用失败后的临时跳过时长（秒）
+_PACK_SUBDIR = "packs"   # data_dir 下存放打包记录的目录
 
 
 # ==========================================================================
@@ -101,6 +111,15 @@ class ForwardSectionConfig(PluginConfigBase):
     prefer_napcat_direct: bool = Field(
         default=True,
         description="优先经 NapCat 用原始消息直接转发（引用节点/单条转发，内容零改动）；关闭后始终经宿主 send.forward 构造节点发送",
+    )
+    destroy_after_forward: bool = Field(
+        default=True,
+        description="分享后销毁：聊天记录包（工具1打包）被分享（工具3）一次后立即从本地数据中删除",
+    )
+    max_forward_count: int = Field(
+        default=3,
+        ge=1,
+        description="最大分享次数：destroy_after_forward 关闭时，聊天记录包最多被分享这么多次后销毁（默认 3 次）",
     )
 
 
@@ -170,6 +189,47 @@ def _fmt_time(ts: float | None) -> str:
         return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
     except Exception:
         return "时间未知"
+
+
+# --------------------------------------------------------------------------
+# 打包记录（pack）存取辅助
+#
+# 每包存为一个 JSON 文件于 data_dir/packs/<pack_id>.json：
+#   {
+#     "pack_id": str, "summary": str, "description": str,
+#     "created_at": float, "source": {kind, chat_id, chat_name},
+#     "items": [ {消息快照，含发送者/内容段/可读摘要/平台消息ID...} ],
+#     "share_count": int
+#   }
+# 纯函数只做路径/编解码；实际读写通过 self._packs_dir()（data_dir）。
+# --------------------------------------------------------------------------
+
+def _pack_file_name(pack_id: str) -> str:
+    """pack_id → 文件名（仅保留安全字符，防路径穿越）。"""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", _as_str(pack_id))
+    return f"{safe}.json" if safe else ""
+
+
+def _pack_listing_to_summary(records: list[dict]) -> str:
+    """把若干包记录格式化为给 LLM 的列表文本（工具2 输出）。"""
+    if not records:
+        return "当前没有可分享的聊天记录包。"
+    lines = ["可分享的聊天记录包（pack_id + 概括）："]
+    for r in records:
+        src = r.get("source") or {}
+        if _as_str(src.get("kind")) == "group":
+            src_desc = f"群 {_as_str(src.get('chat_name')) or _as_str(src.get('chat_id'))}"
+        else:
+            src_desc = f"私聊（{_as_str(src.get('chat_id'))}）"
+        items = r.get("items") or []
+        lines.append(
+            f"- pack_id={r.get('pack_id')} ｜ 来源：{src_desc} ｜ 共 {len(items)} 条 ｜ "
+            f"概括：{_clip(_one_line(r.get('summary') or ''), 200)}"
+        )
+        desc = _one_line(r.get("description") or "")
+        if desc:
+            lines.append(f"  描述：{_clip(desc, 200)}")
+    return "\n".join(lines)
 
 
 def check_permission(list_type: str, id_list: Any, target_id: str) -> bool:
@@ -488,7 +548,8 @@ class MaiForwardPlugin(MaiBotPlugin):
             "- 消息内容自动从 NapCat/宿主数据库原样读取转发，无需也不能自行转述内容；\n"
             "- 群聊/私聊分别有转发名单（黑/白名单）限制，未通过时返回具体原因；\n"
             "- 开启「强制合并」时，转发两天及以上的旧消息会忽略 merge 参数并强制合并；\n"
-            "- 发送成功后会在目标聊天的聊天记录中标注 [转发工具 源→目标]。"
+            "- 转发到**群聊**成功后会在目标群的聊天记录中标注 [转发工具 源→目标]；\n"
+            "- 转发到**私聊**只把消息真发到对方 QQ，不写入 MaiBot 聊天记录（不入库）。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -643,16 +704,9 @@ class MaiForwardPlugin(MaiBotPlugin):
             self.ctx.logger.warning("[麦麦转发] %s", detail)
             return {"success": False, "error": "send_failed", "content": detail}
 
-        # 发送成功 → 注入带来源标注的聊天记录
+        # 发送成功 → 群聊注入带来源标注的聊天记录；私聊只转发不入库（跳过合成记录注入）
         src_id = _as_str(current.get("id")) or "未知"
         dst_id = _as_str(target.get("id")) or _as_str(target.get("stream_id"))
-        record_text = build_forward_record_text(src_id, dst_id, items, merged)
-        injected, inject_err = await self._inject_record(
-            target, record_text, "forward",
-            {"from": src_id, "to": dst_id, "mode": "merged" if merged else "single",
-             "message_ids": ids, "send_path": send_path},
-        )
-
         mode_cn = "合并转发" if merged else "逐条转发"
         if target.get("kind") == "group":
             dst_desc = f"群 {_as_str(target.get('group_id'))}"
@@ -662,8 +716,18 @@ class MaiForwardPlugin(MaiBotPlugin):
             f"（注意：消息早于 {self.config.forward.force_merge_age_days:g} 天，"
             f"已按「强制合并」配置忽略 merge={merge_flag} 参数）"
         ) if forced else ""
-        record_note = "聊天记录已注入并标注来源。" if injected else f"注意：聊天记录注入失败（{inject_err}）。"
-        content = f"已将 {len(items)} 条消息以{mode_cn}方式转发到{dst_desc}{note}。{record_note}"
+        if target.get("kind") == "group":
+            record_text = build_forward_record_text(src_id, dst_id, items, merged)
+            injected, inject_err = await self._inject_record(
+                target, record_text, "forward",
+                {"from": src_id, "to": dst_id, "mode": "merged" if merged else "single",
+                 "message_ids": ids, "send_path": send_path},
+            )
+            record_note = "聊天记录已注入并标注来源。" if injected else f"注意：聊天记录注入失败（{inject_err}）。"
+        else:
+            injected, inject_err = False, "私聊只转发不入库"
+            record_note = ""
+        content = f"已将 {len(items)} 条消息以{mode_cn}方式转发到{dst_desc}{note}。{record_note}".strip()
         self.ctx.logger.info("[麦麦转发] %s（发送路径：%s）", content, send_path)
         return {
             "success": True,
@@ -684,7 +748,7 @@ class MaiForwardPlugin(MaiBotPlugin):
         brief_description="复读指定消息（按原样重新发送）",
         detailed_description=(
             "复读一条消息：把该消息按原样（文本/图片/表情包等）在当前聊天重新发送一次，"
-            "随后在聊天记录中写入一条以 [复读工具] 开头的记录。\n"
+            "随后若在群聊中会在聊天记录写入一条以 [复读工具] 开头的记录；在私聊中只真发不入库。\n"
             "仅在用户明确要求复读某条消息时调用。\n"
             "参数（必填，缺少会直接报错并取消本次调用）：\n"
             "- message_id：要复读的消息 ID（麦麦聊天记录中的消息 ID）"
@@ -758,16 +822,472 @@ class MaiForwardPlugin(MaiBotPlugin):
             return {"success": False, "error": "send_failed", "content": detail}
 
         body = _as_str(info["repeat_plan"].get("text")) or info["readable"]
-        record_text = f"[复读工具] {body}".strip()
-        injected, inject_err = await self._inject_record(
-            current, record_text, "repeat",
-            {"message_id": mid, "origin_chat": f"{info['chat_kind']}:{info['chat_id']}"},
-        )
-
-        record_note = "聊天记录已注入并标注 [复读工具]。" if injected else f"注意：聊天记录注入失败（{inject_err}）。"
-        content = f"已复读消息 {mid}（{info['readable']}）。{record_note}"
+        # 私聊只转发不入库（复读也一致）；群聊注入带 [复读工具] 标注的合成记录
+        if current.get("kind") == "group":
+            record_text = f"[复读工具] {body}".strip()
+            injected, inject_err = await self._inject_record(
+                current, record_text, "repeat",
+                {"message_id": mid, "origin_chat": f"{info['chat_kind']}:{info['chat_id']}"},
+            )
+            record_note = "聊天记录已注入并标注 [复读工具]。" if injected else f"注意：聊天记录注入失败（{inject_err}）。"
+        else:
+            injected, inject_err = False, "私聊只转发不入库"
+            record_note = ""
+        content = f"已复读消息 {mid}（{info['readable']}）。{record_note}".strip()
         self.ctx.logger.info("[麦麦转发] %s", content)
         return {"success": True, "content": content, "repeated": mid, "record_injected": injected}
+
+    # ------------------------------------------------------------------
+    # 打包分享（工具1/2/3）：收集消息包 → 本地存储 → 列包 → 发到当前群
+    # ------------------------------------------------------------------
+
+    @Tool(
+        "pack_chat_messages",
+        brief_description="把当前聊天中感兴趣的若干消息打包收藏，供之后分享到其他群",
+        detailed_description=(
+            "把若干条聊天消息按原样打包收藏（生成 pack_id 存于本地数据），"
+            "供之后在**其他群**里分享。\n"
+            "当你在当前群的聊天记录中发现有值得分享到其他群的内容时调用。\n"
+            "参数（全部必填，缺少任何一个都会直接报错并取消本次调用）：\n"
+            "- message_ids：要打包的消息 ID 列表（麦麦聊天记录中的消息 ID，可多个，按时间顺序传入）\n"
+            "- summary：对整个打包内容的简短概括（一句话）\n"
+            "- description：对整个打包内容的详细描述（用于之后回忆/分享时判断这个包是什么）\n"
+            "行为说明：\n"
+            "- 消息内容自动从 NapCat/宿主数据库原样读取，无需也不能自行转述内容；\n"
+            "- 打包只存本地、不会发送到任何聊天；\n"
+            "- 返回的 pack_id 是这批消息的唯一标识，之后用 list_message_packs 查看、"
+            "share_message_pack 分享。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="message_ids",
+                param_type=ToolParamType.ARRAY,
+                description="要打包的消息 ID 列表（可多个，必填）",
+                required=True,
+                items_schema={"type": "string"},
+            ),
+            ToolParameterInfo(
+                name="summary",
+                param_type=ToolParamType.STRING,
+                description="对整个打包内容的简短概括（一句话，必填）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="description",
+                param_type=ToolParamType.STRING,
+                description="对整个打包内容的详细描述（必填）",
+                required=True,
+            ),
+        ],
+    )
+    async def tool_pack_chat_messages(
+        self,
+        message_ids: Any = None,
+        summary: Any = None,
+        description: Any = None,
+        **kwargs: Any,
+    ) -> dict:
+        try:
+            return await self._do_pack(message_ids, summary, description, kwargs)
+        except Exception as exc:
+            self.ctx.logger.error("[麦麦转发] pack_chat_messages 内部异常：%s", exc, exc_info=True)
+            return {"success": False, "content": f"打包失败：插件内部异常（{exc}）"}
+
+    async def _do_pack(self, message_ids: Any, summary: Any, description: Any, call_kwargs: dict) -> dict:
+        ids = parse_message_ids(message_ids)
+        summary_text = _one_line(summary)
+        desc_text = _one_line(description)
+        if not ids:
+            detail = (
+                "pack_chat_messages 调用失败：缺少必需参数或参数非法 -> message_ids。"
+                "正确用法：message_ids=要打包的消息 ID 数组（可多个），summary=简短概括，"
+                "description=详细描述。本次调用已取消，未保存任何数据。"
+            )
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {"success": False, "error": "missing_or_invalid_parameters", "content": detail}
+        if not summary_text or not desc_text:
+            missing = [k for k, v in (("summary", summary_text), ("description", desc_text)) if not v]
+            detail = (
+                "pack_chat_messages 调用失败：缺少必需参数或参数非法 -> "
+                + "、".join(missing)
+                + "。正确用法：message_ids=要打包的消息 ID 数组，summary=简短概括，"
+                "description=详细描述。本次调用已取消，未保存任何数据。"
+            )
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {"success": False, "error": "missing_or_invalid_parameters", "missing": missing, "content": detail}
+
+        # 读取消息（任一条读取失败 → 整体取消，不部分打包）
+        items: list[dict] = []
+        failures: list[str] = []
+        for mid in ids:
+            info, ferr = await self._fetch_message(mid)
+            if info is None:
+                failures.append(f"{mid}（{ferr}）")
+            else:
+                items.append(info)
+        if failures:
+            detail = (
+                "pack_chat_messages 调用失败：以下消息无法读取，已取消本次打包（未保存任何数据）："
+                + "；".join(failures)
+                + "。请确认消息 ID 是否正确后重试。"
+            )
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {"success": False, "error": "messages_not_found", "failed": failures, "content": detail}
+
+        # 确定来源聊天（取第一条消息的聊天）
+        first = items[0]
+        source = {
+            "kind": first["chat_kind"],
+            "chat_id": first["chat_id"],
+            "chat_name": first.get("group_name") or first["chat_id"],
+            "stream_id": "",
+        }
+        pack_id = f"maiforward-pack-{uuid.uuid4().hex[:12]}"
+        # 只保留分享所需字段（node_segments 内含图片 base64，可完整重发）；
+        # 丢弃 parts/repeat_plan 等冗余大字段，避免本地文件膨胀。
+        keep_keys = (
+            "message_id", "sender_id", "nickname", "cardname", "who",
+            "time_ts", "time_str", "group_id", "group_name", "chat_kind",
+            "chat_id", "node_segments", "readable",
+        )
+        slim_items = [{k: it[k] for k in keep_keys if k in it} for it in items]
+        record = {
+            "pack_id": pack_id,
+            "summary": summary_text,
+            "description": desc_text,
+            "created_at": time.time(),
+            "source": source,
+            "items": slim_items,
+            "share_count": 0,
+        }
+        saved, save_err = await self._pack_save(record)
+        if not saved:
+            detail = f"pack_chat_messages 调用失败：本地写入失败（{save_err}）。"
+            self.ctx.logger.warning("[麦麦转发] %s", detail)
+            return {"success": False, "error": "pack_store_failed", "content": detail}
+
+        readable = "；".join(f"{it['who']}：{it['readable']}" for it in items)
+        content = (
+            f"已把 {len(items)} 条消息打包收藏（pack_id={pack_id}）。\n"
+            f"概括：{summary_text}\n内容：{_clip(readable, 400)}。"
+            "之后可用 list_message_packs 查看本包，或直接在本群或其他群使用 "
+            "share_message_pack 分享。"
+        )
+        self.ctx.logger.info("[麦麦转发] %s", content)
+        return {
+            "success": True,
+            "content": content,
+            "pack_id": pack_id,
+            "packed": len(items),
+            "summary": summary_text,
+        }
+
+    @Tool(
+        "list_message_packs",
+        brief_description="列出本地已打包收藏的聊天记录包（pack_id + 概括），供挑选分享",
+        detailed_description=(
+            "列出本地数据中尚未销毁的全部聊天记录包：每个包的 pack_id、来源群/私聊、"
+            "消息条数、概括与描述。\n"
+            "在分享其他群的聊天记录前先调用本工具拿到 pack_id，再调用 share_message_pack。\n"
+            "参数：无。"
+        ),
+        parameters=[],
+    )
+    async def tool_list_message_packs(self, **kwargs: Any) -> dict:
+        try:
+            records = await self._pack_load_all()
+            text = _pack_listing_to_summary(records)
+            return {
+                "success": True,
+                "content": text,
+                "count": len(records),
+                "packs": [
+                    {
+                        "pack_id": r.get("pack_id"),
+                        "summary": r.get("summary"),
+                        "description": r.get("description"),
+                        "source": r.get("source"),
+                        "message_count": len(r.get("items") or []),
+                        "share_count": r.get("share_count", 0),
+                    }
+                    for r in records
+                ],
+            }
+        except Exception as exc:
+            self.ctx.logger.error("[麦麦转发] list_message_packs 内部异常：%s", exc, exc_info=True)
+            return {"success": False, "content": f"列包失败：插件内部异常（{exc}）"}
+
+    @Tool(
+        "share_message_pack",
+        brief_description="把本地已打包的聊天记录以合并转发发送到当前群聊（需先用 list_message_packs 取 pack_id）",
+        detailed_description=(
+            "把指定 pack_id 的打包聊天记录作为一条合并转发消息发送到**当前聊天**。\n"
+            "当你想把其他群/之前打包的聊天记录分享给当前群时使用。\n"
+            "参数（必填）：\n"
+            "- pack_id：要分享的打包记录 ID（必须来自 list_message_packs，不可凭空编造）\n"
+            "行为说明：\n"
+            "- **必须先调用 list_message_packs** 拿到真实存在的 pack_id，本工具只接受它列出的 ID；\n"
+            "- 发送内容来自打包时原样保存的消息，不由你转述；\n"
+            "- 发送到群聊成功后会在目标群聊天记录中标注；发送到私聊时对方能收到，"
+            "但私聊聊天记录无法显示（本插件不在私聊注入合成记录），你仍应告知用户已转发成功；\n"
+            "- 分享成功后该包可能被销毁或计数（见配置 destroy_after_forward / max_forward_count）。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="pack_id",
+                param_type=ToolParamType.STRING,
+                description="要分享的打包记录 ID（来自 list_message_packs，必填）",
+                required=True,
+            ),
+        ],
+    )
+    async def tool_share_message_pack(self, pack_id: Any = None, **kwargs: Any) -> dict:
+        try:
+            return await self._do_share_pack(pack_id, kwargs)
+        except Exception as exc:
+            self.ctx.logger.error("[麦麦转发] share_message_pack 内部异常：%s", exc, exc_info=True)
+            return {"success": False, "content": f"分享失败：插件内部异常（{exc}）"}
+
+    async def _do_share_pack(self, pack_id: Any, call_kwargs: dict) -> dict:
+        pid = _as_str(pack_id)
+        if not pid:
+            detail = (
+                "share_message_pack 调用失败：缺少必需参数 pack_id。请先调用 "
+                "list_message_packs 查看可用的 pack_id 后重试。本次调用已取消，未发送任何消息。"
+            )
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {"success": False, "error": "missing_or_invalid_parameters", "missing": ["pack_id"], "content": detail}
+
+        record = await self._pack_load(pid)
+        if record is None:
+            detail = (
+                f"share_message_pack 调用失败：pack_id={pid!r} 不存在或已销毁。"
+                "pack_id 必须来自 list_message_packs 的输出，不可凭空编造或使用已销毁的 ID。"
+                "本次调用已取消，未发送任何消息。"
+            )
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {"success": False, "error": "pack_not_found", "content": detail}
+
+        current = await self._current_chat(call_kwargs)
+        if not (_as_str(current.get("stream_id")) or _as_str(current.get("group_id")) or _as_str(current.get("user_id"))):
+            detail = (
+                "share_message_pack 调用失败：无法确定当前聊天流。本次调用已取消，未发送任何消息。"
+            )
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {"success": False, "error": "unknown_current_stream", "content": detail}
+
+        # 名单检查：源 = 包来源聊天，目标 = 当前聊天；允许原地转发（源==目标同群时
+        # 源/目标侧相同，按该群的名单一次判定，通过即可发出）
+        source = record.get("source") or {}
+        source_side = {"kind": source.get("kind"), "id": source.get("chat_id")}
+        if not source_side.get("id"):
+            # 来源缺失（防御）→ 只检查目标侧
+            source_side = {"kind": None, "id": None}
+        perm_err = self._permission_error(source_side, current)
+        if perm_err:
+            self.ctx.logger.warning("[麦麦转发] 分享名单拦截：%s", perm_err)
+            return {"success": False, "error": "permission_denied", "content": perm_err}
+
+        # 组装节点 → 发送（合并转发）
+        items = [it for it in (record.get("items") or []) if isinstance(it, dict)]
+        nodes = [self._build_node(it) for it in items]
+        if not nodes:
+            detail = "share_message_pack 调用失败：该包内没有可发送的消息内容。"
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {"success": False, "error": "pack_empty", "content": detail}
+
+        sid = _as_str(current.get("stream_id"))
+        ok, send_err = await self._send_merged_via_host(nodes, sid)
+        if not ok:
+            detail = (
+                f"share_message_pack 调用失败：消息发送未成功（原因：{send_err or '未知'}）。"
+                "本次未消耗分享次数。可查看主进程日志中 [cap.send.*] 执行失败 定位原因。"
+            )
+            self.ctx.logger.warning("[麦麦转发] %s", detail)
+            return {"success": False, "error": "send_failed", "content": detail}
+
+        # 发送成功 → 计数/销毁
+        consumed, destroy_err = await self._pack_consume(record)
+        if not consumed:
+            self.ctx.logger.warning("[麦麦转发] 分享后更新包状态失败（%s），不影响已发送结果", destroy_err)
+
+        target_kind = current.get("kind")
+        if target_kind == "group":
+            # 群聊目标：注入带来源标注的合成记录（提示信息给 LLM 看，发送本身已完成）
+            src_id = _as_str(source.get("chat_id")) or "未知"
+            dst_id = _as_str(current.get("id")) or _as_str(current.get("stream_id"))
+            summary_line = _clip(_one_line(record.get("summary") or ""), 120)
+            record_text = f"[分享工具 {src_id}→{dst_id}] {summary_line}".strip()
+            injected, inject_err = await self._inject_record(
+                current, record_text, "share",
+                {"from": src_id, "to": dst_id, "pack_id": pid,
+                 "summary": record.get("summary"), "share_count": record.get("share_count", 0)},
+            )
+            record_note = "聊天记录已注入并标注来源。" if injected else f"注意：聊天记录注入失败（{inject_err}）。"
+        else:
+            # 私聊目标：真发成功但不注入（私聊不入库）；明确告知 LLM 已转发成功
+            injected, inject_err = False, "私聊只转发不入库"
+            record_note = (
+                "注意：对方已收到这条合并转发消息，但私聊聊天记录中无法显示该分享记录，"
+                "请向用户说明转发已经成功完成。"
+            )
+
+        lifecycle = ""
+        fw = self.config.forward
+        if record.get("destroyed"):
+            if fw.destroy_after_forward:
+                lifecycle = "（已开启「分享后销毁」，该包已从本地数据中删除）"
+            else:
+                lifecycle = "（该包已达最大分享次数，已从本地数据中销毁）"
+        elif destroy_err:
+            lifecycle = f"（注意：分享后更新包状态失败：{destroy_err}）"
+        else:
+            left = max(int(fw.max_forward_count or 1) - int(record.get("share_count") or 0), 0)
+            lifecycle = f"（该包还可分享 {left} 次，之后自动销毁）"
+
+        dst_desc = f"群 {_as_str(current.get('group_id'))}" if target_kind == "group" else (
+            f"私聊（{_as_str(current.get('user_id'))}）"
+        )
+        content = (
+            f"已把打包记录 {pid} 分享到{dst_desc}。{record_note}{lifecycle}"
+        ).strip()
+        self.ctx.logger.info("[麦麦转发] %s", content)
+        return {
+            "success": True,
+            "content": content,
+            "pack_id": pid,
+            "share_count": record.get("share_count", 0),
+            "record_injected": injected,
+        }
+
+    # ------------------------------------------------------------------
+    # 包存储与分享辅助
+    # ------------------------------------------------------------------
+
+    def _packs_dir(self) -> Path:
+        """本地包目录（data_dir/packs）。按需创建。"""
+        base = getattr(self.ctx, "paths", None)
+        data_dir = getattr(base, "data_dir", None) if base is not None else None
+        if data_dir is None:
+            raise RuntimeError("ctx.paths.data_dir 不可用，无法持久化打包记录")
+        d = Path(data_dir) / _PACK_SUBDIR
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    async def _pack_save(self, record: dict) -> tuple[bool, str]:
+        """写入一个包记录。返回 (成功, 错误)。"""
+        try:
+            pack_id = _as_str(record.get("pack_id"))
+            fname = _pack_file_name(pack_id)
+            if not fname:
+                return False, "pack_id 非法"
+            path = self._packs_dir() / fname
+            path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    async def _pack_load(self, pack_id: str) -> dict | None:
+        """按 pack_id 读一个包；不存在/损坏返回 None。"""
+        fname = _pack_file_name(pack_id)
+        if not fname:
+            return None
+        try:
+            path = self._packs_dir() / fname
+            if not path.is_file():
+                return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) and _as_str(data.get("pack_id")) == pack_id else None
+        except Exception as exc:
+            self.ctx.logger.debug("[麦麦转发] 读包 %s 失败：%s", pack_id, exc)
+            return None
+
+    async def _pack_load_all(self) -> list[dict]:
+        """列出全部包（按创建时间倒序）。"""
+        try:
+            d = self._packs_dir()
+            if not d.is_dir():
+                return []
+            out = []
+            for p in d.glob("*.json"):
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if isinstance(data, dict) and data.get("pack_id"):
+                    out.append(data)
+            out.sort(key=lambda r: float(r.get("created_at") or 0.0), reverse=True)
+            return out
+        except Exception as exc:
+            self.ctx.logger.debug("[麦麦转发] 列包失败：%s", exc)
+            return []
+
+    async def _pack_delete(self, pack_id: str) -> tuple[bool, str]:
+        try:
+            fname = _pack_file_name(pack_id)
+            if not fname:
+                return False, "pack_id 非法"
+            path = self._packs_dir() / fname
+            if path.is_file():
+                path.unlink()
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    async def _pack_consume(self, record: dict) -> tuple[bool, str]:
+        """分享成功后处理包生命周期（计数/销毁）。返回 (是否已妥善处理, 错误)。
+
+        成功返回 True 且 record 已原地更新 share_count；若包被销毁，record 中标记
+        destroyed=True（调用方据此决定文案）。
+        """
+        fw = self.config.forward
+        try:
+            record["share_count"] = int(record.get("share_count") or 0) + 1
+            if fw.destroy_after_forward:
+                # 开启「分享后销毁」：分享一次即删除（max_forward_count 无效）
+                ok, err = await self._pack_delete(_as_str(record.get("pack_id")))
+                if ok:
+                    record["destroyed"] = True
+                return ok, err
+            count = int(record.get("share_count") or 0)
+            max_count = max(int(fw.max_forward_count or 1), 1)
+            if count >= max_count:
+                ok, err = await self._pack_delete(_as_str(record.get("pack_id")))
+                if ok:
+                    record["destroyed"] = True
+                return ok, err
+            ok, err = await self._pack_save(record)
+            return ok, err
+        except Exception as exc:
+            return False, str(exc)
+
+    async def _send_merged_via_host(self, nodes: list[dict], sid: str) -> tuple[bool, str]:
+        """把节点列表以一条合并转发发出（storage_message=False）。失败可清洗图片段重试一次。"""
+        if not sid:
+            return False, "当前聊天流 ID 缺失"
+        try:
+            ok = await self.ctx.send.forward(
+                nodes, sid, storage_message=False, sync_to_maisaka_history=False,
+            )
+        except Exception as exc:
+            return False, f"发送异常：{exc}"
+        if ok:
+            return True, ""
+        if any(
+            _as_str(seg.get("type")) in ("imageurl", "emoji")
+            for node in nodes
+            for seg in (node.get("segments") or [])
+        ):
+            try:
+                ok = await self.ctx.send.forward(
+                    self._sanitize_nodes(nodes), sid,
+                    storage_message=False, sync_to_maisaka_history=False,
+                )
+            except Exception as exc:
+                return False, f"清洗重试发送异常：{exc}"
+            if ok:
+                return True, ""
+        return False, "send.forward 返回失败（可查看主进程日志 [cap.send.*] 执行失败 定位原因）"
 
     # ------------------------------------------------------------------
     # 消息读取（NapCat get_msg 优先，宿主数据库兜底）
@@ -1280,6 +1800,12 @@ class MaiForwardPlugin(MaiBotPlugin):
             "maiforward_injected": tool,
             "maiforward_meta": dict(meta or {}),
         }
+        # 本函数现仅由群聊目标路径调用（转发/复读到私聊在上层直接跳过注入，只真发不入库）；
+        # 私聊分支仅为防御保留。注意：user_info.user_id 决定宿主会话归属——入站注入后
+        # ChatBot.receive_message 会用 user_info.user_id 重算 session_id
+        # （私聊 = md5(平台+账号+user_id+private)），故私聊的 user_id 若被写入必须保持对方 QQ 号，
+        # 否则记录会落入「机器人与自己」的会话、对方私聊历史不可见；WebUI 的 bot/user 判定
+        # 只看 user_id == 机器人账号（is_bot_self），不改宿主无法渲染成 bot 侧气泡。
         if gid:
             user_info = {
                 "user_id": bot["user_id"] or "0",
@@ -1291,11 +1817,11 @@ class MaiForwardPlugin(MaiBotPlugin):
                 "group_name": _as_str(target.get("group_name")) or gid,
             }
         else:
-            # 私聊会话按对方 QQ 号定位：user_info 记为对方；
-            # 该记录由本插件合成的说明写在 additional_config 与正文前缀里。
+            # 防御分支（当前上层不会对私聊调用本函数）：user_id 保持对方保归属，
+            # user_nickname 记为机器人昵称（机器人名义），来源标注在正文前缀。
             user_info = {
                 "user_id": uid,
-                "user_nickname": _as_str(target.get("peer_nickname")) or uid,
+                "user_nickname": bot["nickname"],
                 "user_cardname": None,
             }
             group_info = None
