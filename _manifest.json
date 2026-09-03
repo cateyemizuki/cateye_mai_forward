@@ -3,7 +3,7 @@
   "id": "github.cateye.mai-forward",
   "version": "0.1.0",
   "name": "麦麦转发",
-  "description": "打包指定消息进行合并/逐条转发与复读：消息内容从 NapCat/宿主数据库原样读取（不从 LLM 文本构造），发送后向目标聊天注入带来源标注（[转发工具 源→目标] / [复读工具]）的聊天记录，并提供 forward_messages / repeat_message 两个 LLM 工具。",
+  "description": "消息打包转发/复读/收藏分享：内容从 NapCat/宿主数据库原样读取（不从 LLM 文本构造）；提供 forward_messages（转发到其他聊天，群聊注入 [转发工具] 标注记录、私聊只真发不入库）、repeat_message（复读）、pack_chat_messages（把感兴趣的消息打包到本地，返回 pack_id）、list_message_packs（列包+概括）、share_message_pack（把打包内容以合并转发分享到当前聊天，受名单限制，支持分享后销毁/最大分享次数）。",
   "author": { "name": "cateye", "url": "https://github.com/cateyemizuki" },
   "license": "MIT",
   "urls": {
@@ -30,6 +30,6 @@
   "i18n": { "default_locale": "zh-CN" },
   "plugin_type": "tool",
   "display": {
-    "icon": { "type": "lucide", "value": "forward", "fallback": "➡️" }
+    "icon": { "type": "lucide", "value": "forward", "fallback": "mai-forward" }
   }
 }
