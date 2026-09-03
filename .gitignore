@@ -1,0 +1,12 @@
+# 运行时配置由 Runner 生成，不要提交
+/config.toml
+
+# 冒烟测试仅在本地运行，不随插件上传（发布内容见 README 安装说明）
+/tests_smoke.py
+/tests/
+
+__pycache__/
+*.py[cod]
+
+# Issue 提交文档（本地使用，不随插件上传）
+/ISSUE_SUBMISSION.md

@@ -1,0 +1,1406 @@
+"""麦麦转发（github.cateye.mai-forward）。
+
+提供两个 LLM 工具：
+
+- forward_messages：把指定消息按原样打包，合并或逐条转发到目标聊天流；
+  发送成功后向目标聊天注入一条以 ``[转发工具 源→目标]`` 开头的聊天记录，
+  标明这条信息是从哪里转发来的。
+- repeat_message：把指定消息按原样复读到当前聊天，随后构造一条相同的信息
+  入库，开头额外显示 ``[复读工具]`` 字样。
+
+消息内容一律从 NapCat（get_msg 原始消息段，优先）或 MaiBot 宿主数据库读取，
+不使用 LLM 转述的文本构造转发节点，避免转发信息失真；若所有目标消息都能在
+NapCat 侧解析出平台消息 ID，优先用「引用节点 / 单条转发」让协议端直接使用
+原始消息，内容零改动。
+
+记录注入走 ``@MessageGateway`` + ``ctx.gateway.route_message`` 的
+is_notify 合成通知通道（官方「只入库不真发」通道）：写入数据库、WebUI 可见，
+但不触发回复循环。
+"""
+
+from __future__ import annotations
+
+import re
+import time
+import uuid
+from datetime import datetime
+from typing import Any, ClassVar, Literal
+
+from maibot_sdk import Field, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
+
+SUPPORTED_CONFIG_VERSION = "0.1.0"
+GATEWAY_NAME = "maiforward_recorder"
+PLATFORM = "qq"
+
+_DAY_SECONDS = 86400.0
+_LINE_LIMIT = 400   # 聊天记录里单条消息摘要的最大长度
+_QUOTE_LIMIT = 80   # 回复引用摘要的最大长度
+_NAPCAT_COOLDOWN = 60.0  # NapCat 宿主级调用失败后的临时跳过时长（秒）
+
+
+# ==========================================================================
+# 配置模型
+# ==========================================================================
+
+class _PermissionListBase(PluginConfigBase):
+    """转发名单通用结构（黑名单/白名单可切换）。"""
+
+    list_type: Literal["blacklist", "whitelist"] = Field(
+        default="blacklist",
+        description="名单类型：blacklist=黑名单（留空=全部允许转发）；whitelist=白名单（留空=全部不启用转发）",
+    )
+    id_list: list[str] = Field(
+        default_factory=list,
+        description="名单列表；黑名单留空=全部启用转发，白名单留空=全部不启用转发",
+    )
+
+
+class GroupPermissionConfig(_PermissionListBase):
+    """群聊转发名单（填 QQ 群号）。"""
+
+    __ui_label__ = "群聊转发名单（QQ 群号）"
+    __ui_icon__ = "groups"
+    __ui_order__ = 1
+
+    id_list: list[str] = Field(
+        default_factory=list,
+        description="QQ 群号列表（字符串形式，如 [\"123456789\"]）",
+    )
+
+
+class PrivatePermissionConfig(_PermissionListBase):
+    """私聊转发名单（填 QQ 号）。"""
+
+    __ui_label__ = "私聊转发名单（QQ 号）"
+    __ui_icon__ = "person"
+    __ui_order__ = 2
+
+    id_list: list[str] = Field(
+        default_factory=list,
+        description="QQ 号列表（字符串形式）",
+    )
+
+
+class ForwardSectionConfig(PluginConfigBase):
+    """转发行为配置。"""
+
+    __ui_label__ = "转发行为"
+    __ui_icon__ = "forward"
+    __ui_order__ = 3
+
+    force_merge: bool = Field(
+        default=True,
+        description="强制合并：转发两天及以上的旧消息时忽略 LLM 传入的是否合并参数，强制合并为合并转发",
+    )
+    force_merge_age_days: float = Field(
+        default=2.0,
+        ge=0.0,
+        description="触发强制合并的消息年龄阈值（天），默认 2 天",
+    )
+    prefer_napcat_direct: bool = Field(
+        default=True,
+        description="优先经 NapCat 用原始消息直接转发（引用节点/单条转发，内容零改动）；关闭后始终经宿主 send.forward 构造节点发送",
+    )
+
+
+class PluginSectionConfig(PluginConfigBase):
+    """插件基础配置。"""
+
+    __ui_label__ = "插件"
+    __ui_icon__ = "package"
+    __ui_order__ = 0
+
+    enabled: bool = Field(default=True, description="是否启用插件")
+    config_version: str = Field(
+        default=SUPPORTED_CONFIG_VERSION,
+        description="配置版本（与插件版本同步）",
+        json_schema_extra={"hidden": True, "disabled": True},
+    )
+
+
+class MaiForwardConfig(PluginConfigBase):
+    """麦麦转发完整配置。"""
+
+    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
+    group_permission: GroupPermissionConfig = Field(default_factory=GroupPermissionConfig)
+    private_permission: PrivatePermissionConfig = Field(default_factory=PrivatePermissionConfig)
+    forward: ForwardSectionConfig = Field(default_factory=ForwardSectionConfig)
+
+
+# ==========================================================================
+# 纯逻辑工具函数（不依赖 SDK，便于单独测试）
+# ==========================================================================
+
+def _as_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _clip(text: str, limit: int = _LINE_LIMIT) -> str:
+    t = str(text or "").strip()
+    return t if len(t) <= limit else t[: limit - 1] + "…"
+
+
+def _one_line(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _to_int(value: Any) -> int | str:
+    """平台消息 ID / 群号尽量转 int（QQ message_id 为带符号 int32，负数合法）。"""
+    s = _as_str(value)
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
+    return s
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def _fmt_time(ts: float | None) -> str:
+    if not ts:
+        return "时间未知"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+    except Exception:
+        return "时间未知"
+
+
+def check_permission(list_type: str, id_list: Any, target_id: str) -> bool:
+    """名单判定：黑名单留空=全部允许；白名单留空=全部不允许。"""
+    ids = {_as_str(v) for v in (id_list or []) if _as_str(v)}
+    tid = _as_str(target_id)
+    if str(list_type) == "whitelist":
+        return tid in ids
+    return tid not in ids
+
+
+def parse_message_ids(raw: Any) -> list[str]:
+    """把 LLM 传入的消息 ID 参数规整为字符串列表（容忍逗号/空白分隔的字符串、嵌套数组等）。"""
+    out: list[str] = []
+    if raw is None:
+        return out
+    if isinstance(raw, dict):
+        raw = list(raw.values())
+    if isinstance(raw, (str, int, float)):
+        raw = [raw]
+    for item in raw or []:
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple, dict)):
+            out.extend(parse_message_ids(item))
+            continue
+        s = _as_str(item)
+        if not s:
+            continue
+        if s.endswith(".0") and s[:-2].lstrip("-").isdigit():
+            s = s[:-2]
+        if re.fullmatch(r"-?\d+", s):
+            out.append(s)
+        else:
+            out.extend(p for p in (x.strip() for x in re.split(r"[,，\s]+", s)) if p)
+    return out
+
+
+def coerce_bool(raw: Any) -> bool | None:
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    s = _as_str(raw).lower()
+    if s in ("true", "1", "yes", "on", "是", "合并"):
+        return True
+    if s in ("false", "0", "no", "off", "否", "不", "不合并"):
+        return False
+    return None
+
+
+def _msg_child(msg: dict, key: str) -> Any:
+    """兼容消息 dict 的两种形态：字段在顶层，或嵌套在 message_info 下。"""
+    if not isinstance(msg, dict):
+        return None
+    if key in msg:
+        return msg[key]
+    info = msg.get("message_info")
+    if isinstance(info, dict):
+        return info.get(key)
+    return None
+
+
+def _msg_user_info(msg: dict) -> dict:
+    v = _msg_child(msg, "user_info")
+    return v if isinstance(v, dict) else {}
+
+
+def _msg_group_info(msg: dict) -> dict:
+    v = _msg_child(msg, "group_info")
+    return v if isinstance(v, dict) else {}
+
+
+def _msg_additional(msg: dict) -> dict:
+    v = _msg_child(msg, "additional_config")
+    return v if isinstance(v, dict) else {}
+
+
+def _msg_time_ts(msg: dict) -> float | None:
+    for key in ("timestamp", "time"):
+        v = msg.get(key)
+        if v in (None, ""):
+            continue
+        f = _to_float(v)
+        if f:
+            return f
+    return None
+
+
+def _seg_data(seg: dict) -> Any:
+    data = seg.get("data")
+    if data is None:
+        data = seg.get("content")
+    return data
+
+
+def _onebot_to_parts(segments: Any, reply_quotes: list[str]) -> list[dict]:
+    """OneBot（NapCat get_msg）消息段 → 归一化内容片段。"""
+    parts: list[dict] = []
+    quotes = [q for q in (reply_quotes or [])]
+    qi = 0
+    for seg in segments or []:
+        if not isinstance(seg, dict):
+            continue
+        stype = _as_str(seg.get("type"))
+        data = _seg_data(seg)
+        data = data if isinstance(data, dict) else {}
+        if stype == "text":
+            txt = str(data.get("text") or "")
+            if txt:
+                parts.append({"kind": "text", "text": txt})
+        elif stype == "at":
+            qq = _as_str(data.get("qq"))
+            parts.append({"kind": "text", "text": "@全体成员" if qq == "all" else f"[@{qq or '?'}]"})
+        elif stype == "face":
+            parts.append({"kind": "text", "text": "[表情]"})
+        elif stype == "image":
+            ffile = data.get("file")
+            b64 = ffile[len("base64://"):] if isinstance(ffile, str) and ffile.startswith("base64://") else ""
+            url = _as_str(data.get("url"))
+            if b64:
+                parts.append({"kind": "image_b64", "b64": b64})
+            elif url:
+                parts.append({"kind": "image_url", "url": url})
+            else:
+                parts.append({"kind": "text", "text": "[图片]"})
+        elif stype == "reply":
+            quote = quotes[qi].strip() if qi < len(quotes) else ""
+            qi += 1
+            parts.append({"kind": "text", "text": f"[回复：{_clip(quote, _QUOTE_LIMIT)}]" if quote else "[回复消息]"})
+        elif stype == "record":
+            parts.append({"kind": "text", "text": "[语音]"})
+        elif stype == "video":
+            parts.append({"kind": "text", "text": "[视频]"})
+        elif stype == "file":
+            name = _as_str(data.get("name") or data.get("file_name") or data.get("file"))
+            parts.append({"kind": "text", "text": f"[文件 {_clip(name, 40)}]" if name else "[文件]"})
+        elif stype in ("json", "xml", "share"):
+            parts.append({"kind": "text", "text": "[卡片/链接]"})
+        elif stype in ("forward", "node"):
+            parts.append({"kind": "text", "text": "[合并转发消息]"})
+        elif stype:
+            parts.append({"kind": "text", "text": f"[{stype}]"})
+    return parts
+
+
+def _maibot_to_parts(segments: Any) -> list[dict]:
+    """MaiBot 宿主 raw_message 消息段 → 归一化内容片段。"""
+    parts: list[dict] = []
+    for seg in segments or []:
+        if not isinstance(seg, dict):
+            continue
+        stype = _as_str(seg.get("type"))
+        data = _seg_data(seg)
+        if stype == "text":
+            txt = str(data.get("text") or "") if isinstance(data, dict) else str(data or "")
+            if txt:
+                parts.append({"kind": "text", "text": txt})
+        elif stype == "at":
+            if isinstance(data, dict):
+                who = _as_str(data.get("target_user_nickname")) or _as_str(data.get("target_user_id"))
+                parts.append({"kind": "text", "text": f"[@{who or '?'}]"})
+        elif stype in ("image", "emoji"):
+            b64 = seg.get("binary_data_base64")
+            b64 = b64 if isinstance(b64, str) and b64 else ""
+            url = _as_str(seg.get("url") or (data.get("url") if isinstance(data, dict) else ""))
+            if b64:
+                parts.append({"kind": "emoji_b64" if stype == "emoji" else "image_b64", "b64": b64})
+            elif url:
+                parts.append({"kind": "image_url", "url": url})
+            else:
+                parts.append({"kind": "text", "text": "[表情包]" if stype == "emoji" else "[图片]"})
+        elif stype == "reply":
+            if isinstance(data, dict):
+                quote = _as_str(data.get("target_message_content"))
+                parts.append({"kind": "text", "text": f"[回复：{_clip(quote, _QUOTE_LIMIT)}]" if quote else "[回复消息]"})
+        elif stype == "face":
+            parts.append({"kind": "text", "text": "[表情]"})
+        elif stype == "voice":
+            parts.append({"kind": "text", "text": "[语音]"})
+        elif stype == "video":
+            parts.append({"kind": "text", "text": "[视频]"})
+        elif stype == "file":
+            parts.append({"kind": "text", "text": "[文件]"})
+        elif stype == "forward":
+            parts.append({"kind": "text", "text": "[合并转发消息]"})
+        elif stype in ("json", "xml", "dict", "share"):
+            parts.append({"kind": "text", "text": "[卡片/链接]"})
+        elif stype:
+            parts.append({"kind": "text", "text": f"[{stype}]"})
+    return parts
+
+
+def _parts_to_node_segments(parts: list[dict]) -> list[dict]:
+    """归一化片段 → 宿主 send.forward 转发节点段。"""
+    out: list[dict] = []
+    for p in parts:
+        k = p.get("kind")
+        if k == "text":
+            out.append({"type": "text", "content": p.get("text", "")})
+        elif k == "image_b64":
+            out.append({"type": "image", "content": p.get("b64", "")})
+        elif k == "image_url":
+            out.append({"type": "imageurl", "content": p.get("url", "")})
+        elif k == "emoji_b64":
+            out.append({"type": "emoji", "content": p.get("b64", "")})
+    return out or [{"type": "text", "content": "[空消息]"}]
+
+
+def _parts_to_plain_text(parts: list[dict]) -> str:
+    """保留原始换行的纯文本（复读发送用）。"""
+    chunks: list[str] = []
+    for p in parts:
+        k = p.get("kind")
+        if k == "text":
+            chunks.append(p.get("text", ""))
+        elif k in ("image_b64", "image_url"):
+            chunks.append("[图片]")
+        elif k == "emoji_b64":
+            chunks.append("[表情包]")
+    return "".join(chunks).strip()
+
+
+def _parts_to_readable(parts: list[dict]) -> str:
+    """单行可读摘要（聊天记录行内使用）。"""
+    return _clip(_one_line(_parts_to_plain_text(parts)) or "[空消息]")
+
+
+def build_forward_record_text(src_id: str, dst_id: str, items: list[dict], merged: bool) -> str:
+    """构造注入数据库的记录文本：开头标注 [转发工具 源→目标]。"""
+    head = f"[转发工具 {src_id}→{dst_id}]"
+    if len(items) == 1:
+        it = items[0]
+        return f"{head} {it['who']}：{it['readable']}"
+    mode = "合并转发" if merged else "逐条转发"
+    lines = [f"{head} （{mode}，共 {len(items)} 条）"]
+    for idx, it in enumerate(items, 1):
+        lines.append(f"{idx}. [{it['time_str']}] {it['who']}：{it['readable']}")
+    return "\n".join(lines)
+
+
+# ==========================================================================
+# 插件主体
+# ==========================================================================
+
+class MaiForwardPlugin(MaiBotPlugin):
+    """麦麦转发：消息打包转发与复读。"""
+
+    config_model: ClassVar[type[PluginConfigBase]] = MaiForwardConfig
+
+    # 进程内缓存（on_load 时初始化，这里给类级默认兜底）
+    _bot_info_cache: dict[str, str] | None = None
+    _napcat_dead_until: float = 0.0
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+
+    async def on_load(self) -> None:
+        self._bot_info_cache = None
+        self._napcat_dead_until = 0.0
+        try:
+            await self.ctx.gateway.update_state(GATEWAY_NAME, ready=True, platform=PLATFORM)
+            self.ctx.logger.info("[麦麦转发] 合成记录网关 %s 已就绪", GATEWAY_NAME)
+        except Exception as exc:
+            self.ctx.logger.error("[麦麦转发] 网关就绪上报失败：%s", exc)
+        fw = self.config.forward
+        self.ctx.logger.info(
+            "[麦麦转发] 已加载（强制合并=%s，阈值=%.1f 天，NapCat 直连优先=%s）",
+            fw.force_merge, fw.force_merge_age_days, fw.prefer_napcat_direct,
+        )
+
+    async def on_unload(self) -> None:
+        try:
+            await self.ctx.gateway.update_state(GATEWAY_NAME, ready=False, platform=PLATFORM)
+        except Exception as exc:
+            self.ctx.logger.warning("[麦麦转发] 网关离线上报失败：%s", exc)
+        self.ctx.logger.info("[麦麦转发] 已卸载")
+
+    async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
+        self.ctx.logger.debug(
+            "[麦麦转发] 配置已更新 scope=%s version=%s（运行时直接读 self.config，无需额外处理）",
+            scope, version,
+        )
+
+    # ------------------------------------------------------------------
+    # 合成记录注入网关（只入库不真发的官方通道）
+    # ------------------------------------------------------------------
+
+    @MessageGateway(
+        "receive",
+        name=GATEWAY_NAME,
+        platform=PLATFORM,
+        description="麦麦转发合成聊天记录注入网关（只入库不发送）",
+    )
+    async def gateway_recorder(self, **kwargs: Any):
+        return None
+
+    # ------------------------------------------------------------------
+    # LLM 工具 1：打包转发
+    # ------------------------------------------------------------------
+
+    @Tool(
+        "forward_messages",
+        brief_description="打包指定消息，合并或逐条转发到其他聊天",
+        detailed_description=(
+            "把若干条消息按原样打包转发到目标聊天（合并转发或逐条转发）。\n"
+            "仅在用户明确要求转发/打包聊天记录时调用。\n"
+            "参数（全部必填，缺少任何一个都会直接报错并取消本次调用）：\n"
+            "- message_ids：要打包的消息 ID 列表（麦麦聊天记录中的消息 ID，可传多个，按时间顺序传入）\n"
+            "- target_stream_id：目标聊天流 ID（也接受目标群号或对方 QQ 号）\n"
+            "- merge：是否合并为一条合并转发消息（true/false）\n"
+            "行为说明：\n"
+            "- 消息内容自动从 NapCat/宿主数据库原样读取转发，无需也不能自行转述内容；\n"
+            "- 群聊/私聊分别有转发名单（黑/白名单）限制，未通过时返回具体原因；\n"
+            "- 开启「强制合并」时，转发两天及以上的旧消息会忽略 merge 参数并强制合并；\n"
+            "- 发送成功后会在目标聊天的聊天记录中标注 [转发工具 源→目标]。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="message_ids",
+                param_type=ToolParamType.ARRAY,
+                description="要打包转发的消息 ID 列表（可多个，必填）",
+                required=True,
+                items_schema={"type": "string"},
+            ),
+            ToolParameterInfo(
+                name="target_stream_id",
+                param_type=ToolParamType.STRING,
+                description="目标聊天流 ID（也接受目标群号或对方 QQ 号，必填）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="merge",
+                param_type=ToolParamType.BOOLEAN,
+                description="是否合并为一条合并转发消息（必填）",
+                required=True,
+            ),
+        ],
+    )
+    async def tool_forward_messages(
+        self,
+        message_ids: Any = None,
+        target_stream_id: Any = None,
+        merge: Any = None,
+        **kwargs: Any,
+    ) -> dict:
+        try:
+            return await self._do_forward(message_ids, target_stream_id, merge, kwargs)
+        except Exception as exc:
+            self.ctx.logger.error("[麦麦转发] forward_messages 内部异常：%s", exc, exc_info=True)
+            return {"success": False, "content": f"转发失败：插件内部异常（{exc}）"}
+
+    async def _do_forward(self, message_ids: Any, target_stream_id: Any, merge: Any, call_kwargs: dict) -> dict:
+        # 容忍 LLM 的常见别名传参（不影响「缺少参数必须报错」的语义）
+        if message_ids is None and call_kwargs.get("message_id") is not None:
+            message_ids = call_kwargs.get("message_id")
+            self.ctx.logger.debug("[麦麦转发] forward_messages 使用了别名参数 message_id")
+        if not _as_str(target_stream_id):
+            for alias in ("target_chat_id", "to_stream_id", "chat_stream_id", "target_group_id"):
+                if _as_str(call_kwargs.get(alias)):
+                    target_stream_id = call_kwargs.get(alias)
+                    self.ctx.logger.debug("[麦麦转发] forward_messages 使用了别名参数 %s", alias)
+                    break
+        if merge is None:
+            for alias in ("is_merge", "merged", "as_merge"):
+                v = coerce_bool(call_kwargs.get(alias))
+                if v is not None:
+                    merge = v
+                    self.ctx.logger.debug("[麦麦转发] forward_messages 使用了别名参数 %s", alias)
+                    break
+
+        ids = parse_message_ids(message_ids)
+        seen: set[str] = set()
+        ids = [x for x in ids if not (x in seen or seen.add(x))]
+        merge_flag = coerce_bool(merge)
+
+        missing: list[str] = []
+        if not ids:
+            missing.append("message_ids")
+        if not _as_str(target_stream_id):
+            missing.append("target_stream_id")
+        if merge_flag is None:
+            missing.append("merge")
+        if missing:
+            detail = (
+                "forward_messages 调用失败：缺少必需参数或参数非法 -> "
+                + "、".join(missing)
+                + f"；本次收到：message_ids={message_ids!r}，target_stream_id={target_stream_id!r}，merge={merge!r}。"
+                "正确用法：message_ids=要打包的消息 ID 数组（可多个），target_stream_id=目标聊天流 ID，"
+                "merge=true/false（是否合并转发）。本次调用已取消，未发送任何消息。"
+            )
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {
+                "success": False,
+                "error": "missing_or_invalid_parameters",
+                "missing": missing,
+                "content": detail,
+            }
+
+        target, err = await self._resolve_target_stream(target_stream_id)
+        if target is None:
+            detail = (
+                f"forward_messages 调用失败：{err}（传入值：{target_stream_id!r}）。"
+                "本次调用已取消，未发送任何消息。"
+            )
+            self.ctx.logger.warning("[麦麦转发] %s", detail)
+            return {"success": False, "error": "target_stream_not_found", "content": detail}
+
+        current = await self._current_chat(call_kwargs)
+
+        perm_err = self._permission_error(current, target)
+        if perm_err:
+            self.ctx.logger.warning("[麦麦转发] 名单拦截：%s", perm_err)
+            return {"success": False, "error": "permission_denied", "content": perm_err}
+
+        items: list[dict] = []
+        failures: list[str] = []
+        for mid in ids:
+            info, ferr = await self._fetch_message(mid)
+            if info is None:
+                failures.append(f"{mid}（{ferr}）")
+            else:
+                items.append(info)
+        if failures:
+            detail = (
+                "forward_messages 调用失败：以下消息无法读取，已取消本次转发（未发送任何消息）："
+                + "；".join(failures)
+                + "。请确认消息 ID 是否正确后重试。"
+            )
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {
+                "success": False,
+                "error": "messages_not_found",
+                "failed": failures,
+                "content": detail,
+            }
+
+        merged, forced = self._decide_merge(merge_flag, items)
+
+        # 发送：优先 NapCat 直连（引用原始消息），不可用回退宿主 send.forward
+        send_path = ""
+        if self.config.forward.prefer_napcat_direct and all(it.get("qq_id") for it in items):
+            ok, send_err, sent = await self._send_direct(merged, target, items)
+            if ok:
+                send_path = "NapCat 原始消息直连"
+            elif sent == 0:
+                self.ctx.logger.debug(
+                    "[麦麦转发] NapCat 直连发送不可用（%s），回退宿主 send.forward 路径", send_err,
+                )
+                ok, send_err = await self._send_via_host(merged, target, items)
+                send_path = "宿主 send.forward（回退）"
+            else:
+                detail = (
+                    f"forward_messages 部分失败：已逐条转发 {sent}/{len(items)} 条后出错（{send_err}），"
+                    "为避免重复发送已停止，请把实际情况告知用户。"
+                )
+                self.ctx.logger.warning("[麦麦转发] %s", detail)
+                return {"success": False, "error": "partial_send_failed", "sent": sent, "content": detail}
+        else:
+            ok, send_err = await self._send_via_host(merged, target, items)
+            send_path = "宿主 send.forward"
+
+        if not ok:
+            detail = (
+                f"forward_messages 调用失败：消息发送未成功（路径：{send_path}；原因：{send_err or '未知'}）。"
+                "本次未写入聊天记录。可查看主进程日志中 [cap.send.*] 执行失败 定位原因。"
+            )
+            self.ctx.logger.warning("[麦麦转发] %s", detail)
+            return {"success": False, "error": "send_failed", "content": detail}
+
+        # 发送成功 → 注入带来源标注的聊天记录
+        src_id = _as_str(current.get("id")) or "未知"
+        dst_id = _as_str(target.get("id")) or _as_str(target.get("stream_id"))
+        record_text = build_forward_record_text(src_id, dst_id, items, merged)
+        injected, inject_err = await self._inject_record(
+            target, record_text, "forward",
+            {"from": src_id, "to": dst_id, "mode": "merged" if merged else "single",
+             "message_ids": ids, "send_path": send_path},
+        )
+
+        mode_cn = "合并转发" if merged else "逐条转发"
+        if target.get("kind") == "group":
+            dst_desc = f"群 {_as_str(target.get('group_id'))}"
+        else:
+            dst_desc = f"私聊（{_as_str(target.get('user_id'))}）"
+        note = (
+            f"（注意：消息早于 {self.config.forward.force_merge_age_days:g} 天，"
+            f"已按「强制合并」配置忽略 merge={merge_flag} 参数）"
+        ) if forced else ""
+        record_note = "聊天记录已注入并标注来源。" if injected else f"注意：聊天记录注入失败（{inject_err}）。"
+        content = f"已将 {len(items)} 条消息以{mode_cn}方式转发到{dst_desc}{note}。{record_note}"
+        self.ctx.logger.info("[麦麦转发] %s（发送路径：%s）", content, send_path)
+        return {
+            "success": True,
+            "content": content,
+            "forwarded": len(items),
+            "mode": "merged" if merged else "single",
+            "forced_merge": forced,
+            "target_stream_id": _as_str(target.get("stream_id")),
+            "record_injected": injected,
+        }
+
+    # ------------------------------------------------------------------
+    # LLM 工具 2：复读
+    # ------------------------------------------------------------------
+
+    @Tool(
+        "repeat_message",
+        brief_description="复读指定消息（按原样重新发送）",
+        detailed_description=(
+            "复读一条消息：把该消息按原样（文本/图片/表情包等）在当前聊天重新发送一次，"
+            "随后在聊天记录中写入一条以 [复读工具] 开头的记录。\n"
+            "仅在用户明确要求复读某条消息时调用。\n"
+            "参数（必填，缺少会直接报错并取消本次调用）：\n"
+            "- message_id：要复读的消息 ID（麦麦聊天记录中的消息 ID）"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="message_id",
+                param_type=ToolParamType.STRING,
+                description="要复读的消息 ID（必填）",
+                required=True,
+            ),
+        ],
+    )
+    async def tool_repeat_message(self, message_id: Any = None, **kwargs: Any) -> dict:
+        try:
+            return await self._do_repeat(message_id, kwargs)
+        except Exception as exc:
+            self.ctx.logger.error("[麦麦转发] repeat_message 内部异常：%s", exc, exc_info=True)
+            return {"success": False, "content": f"复读失败：插件内部异常（{exc}）"}
+
+    async def _do_repeat(self, message_id: Any, call_kwargs: dict) -> dict:
+        mid = _as_str(message_id)
+        if not mid:
+            detail = (
+                "repeat_message 调用失败：缺少必需参数 message_id（要复读的消息 ID）。"
+                "本次调用已取消，未发送任何消息。"
+            )
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {
+                "success": False,
+                "error": "missing_or_invalid_parameters",
+                "missing": ["message_id"],
+                "content": detail,
+            }
+
+        current = await self._current_chat(call_kwargs)
+        if not (_as_str(current.get("stream_id")) or _as_str(current.get("group_id")) or _as_str(current.get("user_id"))):
+            detail = (
+                "repeat_message 调用失败：无法确定当前聊天流（缺少 stream_id/message 上下文）。"
+                "本次调用已取消，未发送任何消息。"
+            )
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {"success": False, "error": "unknown_current_stream", "content": detail}
+
+        info, ferr = await self._fetch_message(mid)
+        if info is None:
+            detail = f"repeat_message 调用失败：消息 {mid} 无法读取（{ferr}）。请确认消息 ID 是否正确。"
+            self.ctx.logger.debug("[麦麦转发] %s", detail)
+            return {"success": False, "error": "message_not_found", "content": detail}
+
+        # 跨聊天复读视为转发，同样走名单检查；同聊天复读不检查
+        origin = {"kind": info["chat_kind"], "id": info["chat_id"]}
+        same_chat = (
+            _as_str(origin.get("id")) == _as_str(current.get("id"))
+            and origin.get("kind") == current.get("kind")
+            and bool(_as_str(origin.get("id")))
+        )
+        if not same_chat:
+            perm_err = self._permission_error(origin, current)
+            if perm_err:
+                self.ctx.logger.warning("[麦麦转发] 复读名单拦截：%s", perm_err)
+                return {"success": False, "error": "permission_denied", "content": perm_err}
+
+        ok, send_err = await self._send_repeat(_as_str(current.get("stream_id")), info["repeat_plan"])
+        if not ok:
+            detail = (
+                f"repeat_message 调用失败：消息发送未成功（原因：{send_err or '未知'}）。"
+                "本次未写入聊天记录。可查看主进程日志中 [cap.send.*] 执行失败 定位原因。"
+            )
+            self.ctx.logger.warning("[麦麦转发] %s", detail)
+            return {"success": False, "error": "send_failed", "content": detail}
+
+        body = _as_str(info["repeat_plan"].get("text")) or info["readable"]
+        record_text = f"[复读工具] {body}".strip()
+        injected, inject_err = await self._inject_record(
+            current, record_text, "repeat",
+            {"message_id": mid, "origin_chat": f"{info['chat_kind']}:{info['chat_id']}"},
+        )
+
+        record_note = "聊天记录已注入并标注 [复读工具]。" if injected else f"注意：聊天记录注入失败（{inject_err}）。"
+        content = f"已复读消息 {mid}（{info['readable']}）。{record_note}"
+        self.ctx.logger.info("[麦麦转发] %s", content)
+        return {"success": True, "content": content, "repeated": mid, "record_injected": injected}
+
+    # ------------------------------------------------------------------
+    # 消息读取（NapCat get_msg 优先，宿主数据库兜底）
+    # ------------------------------------------------------------------
+
+    async def _fetch_message(self, message_id: str) -> tuple[dict | None, str]:
+        mid = _as_str(message_id)
+        mb = await self._mb_get_message(mid)
+        if mb is None:
+            return None, "宿主数据库中不存在该消息"
+
+        platform = _as_str(mb.get("platform")) or PLATFORM
+        qq_id, nap_data = "", None
+        if platform == PLATFORM:
+            qq_id, nap_data, nap_err = await self._resolve_via_napcat(mid, mb)
+            if nap_data is None:
+                self.ctx.logger.debug(
+                    "[麦麦转发] 消息 %s 未能从 NapCat 读取原始内容（%s），改用宿主消息记录", mid, nap_err,
+                )
+
+        raw_segments = _msg_child(mb, "raw_message")
+        if not isinstance(raw_segments, list):
+            raw_segments = []
+
+        if nap_data is not None:
+            quotes = [
+                _as_str(seg.get("data", {}).get("target_message_content"))
+                for seg in raw_segments
+                if isinstance(seg, dict) and seg.get("type") == "reply" and isinstance(seg.get("data"), dict)
+            ]
+            raw_msg = nap_data.get("message")
+            if isinstance(raw_msg, str):
+                parts = [{"kind": "text", "text": raw_msg}] if raw_msg else []
+            else:
+                parts = _onebot_to_parts(raw_msg, quotes)
+            sender = nap_data.get("sender") if isinstance(nap_data.get("sender"), dict) else {}
+            sender_id = _as_str(sender.get("user_id")) or _as_str(_msg_user_info(mb).get("user_id"))
+            cardname = _as_str(sender.get("card"))
+            nickname = _as_str(sender.get("nickname")) or _as_str(_msg_user_info(mb).get("user_nickname"))
+            ts = _to_float(nap_data.get("time")) or _msg_time_ts(mb)
+            source = "napcat"
+        else:
+            parts = _maibot_to_parts(raw_segments)
+            if not parts:
+                text = _as_str(mb.get("processed_plain_text"))
+                parts = [{"kind": "text", "text": text}] if text else []
+            user = _msg_user_info(mb)
+            sender_id = _as_str(user.get("user_id"))
+            nickname = _as_str(user.get("user_nickname"))
+            cardname = _as_str(user.get("user_cardname"))
+            ts = _msg_time_ts(mb)
+            source = "maibot"
+
+        if not parts:
+            parts = [{"kind": "text", "text": "[空消息]"}]
+
+        group = _msg_group_info(mb)
+        group_id = _as_str(group.get("group_id"))
+        nickname = nickname or sender_id
+        if cardname and nickname and cardname != nickname:
+            who = f"{cardname}（{nickname}）"
+        else:
+            who = nickname or sender_id or "未知用户"
+
+        info = {
+            "message_id": mid,
+            "qq_id": qq_id,
+            "source": source,
+            "sender_id": sender_id,
+            "nickname": nickname,
+            "cardname": cardname,
+            "who": who,
+            "time_ts": ts,
+            "time_str": _fmt_time(ts),
+            "group_id": group_id,
+            "group_name": _as_str(group.get("group_name")),
+            "chat_kind": "group" if group_id else "private",
+            "chat_id": group_id or sender_id,
+            "parts": parts,
+            "node_segments": _parts_to_node_segments(parts),
+            "readable": _parts_to_readable(parts),
+            "repeat_plan": self._build_repeat_plan(parts),
+        }
+        self.ctx.logger.debug(
+            "[麦麦转发] 已读取消息 %s（来源=%s，平台消息ID=%s，发送者=%s，内容=%s）",
+            mid, source, qq_id or "-", info["who"], info["readable"],
+        )
+        return info, ""
+
+    async def _mb_get_message(self, message_id: str) -> dict | None:
+        try:
+            msg = await self.ctx.message.get_by_id(message_id, include_binary_data=True)
+        except Exception as exc:
+            self.ctx.logger.debug("[麦麦转发] message.get_by_id(%s) 异常：%s", message_id, exc)
+            return None
+        if isinstance(msg, list):
+            msg = msg[0] if msg else None
+        return msg if isinstance(msg, dict) and msg else None
+
+    async def _resolve_via_napcat(self, message_id: str, mb: dict) -> tuple[str, dict | None, str]:
+        """尝试用若干候选 ID 从 NapCat get_msg 拉取原始消息。返回 (命中的ID, 数据, 错误)。"""
+        last_err = ""
+        tried: set[str] = set()
+        for cand in self._qq_id_candidates(message_id, mb)[:6]:
+            if cand in tried:
+                continue
+            tried.add(cand)
+            ok, data, err = await self._napcat_action("get_msg", {"message_id": _to_int(cand)})
+            if ok and isinstance(data, dict) and (data.get("message") is not None or data.get("sender")):
+                return cand, data, ""
+            last_err = err
+        return "", None, last_err or "无可用候选消息 ID"
+
+    @staticmethod
+    def _qq_id_candidates(message_id: str, mb: dict) -> list[str]:
+        addc = _msg_additional(mb)
+        cands = [_as_str(message_id)]
+        for src in (addc, mb):
+            for key in ("message_id", "platform_message_id", "napcat_message_id",
+                        "external_message_id", "qq_message_id", "real_message_id"):
+                v = _as_str(src.get(key))
+                if v:
+                    cands.append(v)
+        m = re.search(r"(-?\d+)$", _as_str(message_id))
+        if m:
+            cands.append(m.group(1))
+        out: list[str] = []
+        for c in cands:
+            if c and c not in out:
+                out.append(c)
+        return out
+
+    @staticmethod
+    def _build_repeat_plan(parts: list[dict]) -> dict:
+        """根据归一化片段决定复读的发送方式。"""
+        kinds = [p["kind"] for p in parts]
+        plain = _parts_to_plain_text(parts)
+        plan: dict = {"text": plain, "readable": _parts_to_readable(parts)}
+        if kinds and all(k == "text" for k in kinds):
+            plan["mode"] = "text"
+            return plan
+        if kinds == ["emoji_b64"]:
+            plan.update(mode="emoji", b64=parts[0].get("b64", ""))
+            return plan
+        if any(k in ("image_b64", "emoji_b64") for k in kinds):
+            segs: list[dict] = []
+            for p in parts:
+                if p["kind"] == "text":
+                    segs.append({"type": "text", "content": p.get("text", "")})
+                elif p["kind"] in ("image_b64", "emoji_b64"):
+                    segs.append({"type": "image", "content": p.get("b64", "")})
+            plan.update(mode="hybrid", segments=segs)
+            return plan
+        if any(k == "image_url" for k in kinds):
+            plan.update(mode="node", segments=_parts_to_node_segments(parts))
+            return plan
+        plan["mode"] = "text"
+        return plan
+
+    # ------------------------------------------------------------------
+    # 发送
+    # ------------------------------------------------------------------
+
+    def _decide_merge(self, merge_flag: bool, items: list[dict]) -> tuple[bool, bool]:
+        """返回 (最终是否合并, 是否触发强制合并)。"""
+        merged = merge_flag
+        forced = False
+        fw = self.config.forward
+        if fw.force_merge:
+            threshold_days = max(float(fw.force_merge_age_days or 0.0), 0.0)
+            now = time.time()
+            oldest = min((it.get("time_ts") or now) for it in items)
+            if now - oldest >= threshold_days * _DAY_SECONDS:
+                if not merged:
+                    self.ctx.logger.debug(
+                        "[麦麦转发] 强制合并生效：最早消息时间 %s，超过阈值 %.1f 天，忽略 LLM 的 merge=false",
+                        _fmt_time(oldest), threshold_days,
+                    )
+                    forced = True
+                merged = True
+        return merged, forced
+
+    async def _send_direct(self, merged: bool, target: dict, items: list[dict]) -> tuple[bool, str, int]:
+        """NapCat 直连：合并转发用引用节点（原始消息由协议端/服务器取用，零改动），
+        逐条转发用 forward_group_single_msg / forward_friend_single_msg。"""
+        gid = _as_str(target.get("group_id"))
+        uid = _as_str(target.get("user_id"))
+        if merged:
+            if gid:
+                action, key, val = "send_group_forward_msg", "group_id", gid
+            else:
+                action, key, val = "send_private_forward_msg", "user_id", uid
+            nodes = [{"type": "node", "data": {"id": it["qq_id"]}} for it in items]
+            ok, _data, err = await self._napcat_action(action, {key: _to_int(val), "messages": nodes})
+            return ok, err, 1 if ok else 0
+        action = "forward_group_single_msg" if gid else "forward_friend_single_msg"
+        key = "group_id" if gid else "user_id"
+        val = _to_int(gid or uid)
+        sent = 0
+        for it in items:
+            ok, _data, err = await self._napcat_action(action, {key: val, "message_id": _to_int(it["qq_id"])})
+            if not ok:
+                return False, f"第 {sent + 1} 条（消息 {it['message_id']}）转发失败：{err}", sent
+            sent += 1
+        return True, "", sent
+
+    async def _send_via_host(self, merged: bool, target: dict, items: list[dict]) -> tuple[bool, str]:
+        sid = _as_str(target.get("stream_id"))
+        if not sid:
+            return False, "目标聊天流 ID 缺失"
+        nodes = [self._build_node(it) for it in items]
+
+        async def attempt(node_list: list[dict]) -> tuple[bool, int]:
+            """返回 (是否全部成功, 已成功条数)；merged 为整包一次原子调用。"""
+            if merged:
+                ok = await self.ctx.send.forward(
+                    node_list, sid, storage_message=False, sync_to_maisaka_history=False,
+                )
+                return bool(ok), 1 if ok else 0
+            sent = 0
+            for node in node_list:
+                ok = await self.ctx.send.forward(
+                    [node], sid, storage_message=False, sync_to_maisaka_history=False,
+                )
+                if not ok:
+                    return False, sent
+                sent += 1
+            return True, sent
+
+        try:
+            ok, sent = await attempt(nodes)
+        except Exception as exc:
+            return False, f"发送异常：{exc}"
+        if ok:
+            return True, ""
+        # 段类型兼容性重试：只重试未发出的部分，把 imageurl/emoji 替换为占位文本
+        remaining = nodes[sent:]
+        if remaining and any(
+            _as_str(seg.get("type")) in ("imageurl", "emoji")
+            for node in remaining
+            for seg in (node.get("segments") or [])
+        ):
+            self.ctx.logger.debug(
+                "[麦麦转发] send.forward 失败（已发出 %s 条），将图片/表情段替换为占位文本后重试剩余部分",
+                sent,
+            )
+            try:
+                ok, _sent2 = await attempt(self._sanitize_nodes(remaining))
+            except Exception as exc:
+                return False, f"重试发送异常（已发出 {sent} 条）：{exc}"
+            if ok:
+                return True, ""
+        detail = "send.forward 返回失败"
+        if sent:
+            detail += f"（已发出 {sent}/{len(nodes)} 条，未发送部分不自动重发，避免重复）"
+        detail += "（可查看主进程日志 [cap.send.*] 执行失败 定位原因）"
+        return False, detail
+
+    @staticmethod
+    def _build_node(it: dict) -> dict:
+        nickname = _as_str(it.get("nickname")) or _as_str(it.get("sender_id")) or "未知用户"
+        cardname = _as_str(it.get("cardname"))
+        return {
+            "user_id": _as_str(it.get("sender_id")) or "0",
+            "user_nickname": nickname,
+            "nickname": cardname or nickname,
+            "user_cardname": cardname,
+            "segments": it.get("node_segments") or [{"type": "text", "content": it.get("readable") or "[空消息]"}],
+        }
+
+    @staticmethod
+    def _sanitize_nodes(nodes: list[dict]) -> list[dict]:
+        clean: list[dict] = []
+        for node in nodes:
+            segs: list[dict] = []
+            for seg in node.get("segments") or []:
+                t = _as_str(seg.get("type"))
+                if t == "imageurl":
+                    segs.append({"type": "text", "content": "[图片]"})
+                elif t == "emoji":
+                    segs.append({"type": "text", "content": "[表情包]"})
+                else:
+                    segs.append(seg)
+            clean.append({**node, "segments": segs or [{"type": "text", "content": "[空消息]"}]})
+        return clean
+
+    async def _send_repeat(self, sid: str, plan: dict) -> tuple[bool, str]:
+        if not sid:
+            return False, "当前聊天流 ID 缺失"
+        common = {"storage_message": False, "sync_to_maisaka_history": False}
+        mode = plan.get("mode")
+        primary_err = ""
+        try:
+            if mode == "emoji":
+                ok = await self.ctx.send.emoji(str(plan.get("b64") or ""), sid, **common)
+            elif mode == "hybrid":
+                ok = await self.ctx.send.hybrid(list(plan.get("segments") or []), sid, **common)
+            elif mode == "node":
+                node = {
+                    "user_id": "0",
+                    "user_nickname": "复读",
+                    "user_cardname": "",
+                    "segments": list(plan.get("segments") or [{"type": "text", "content": str(plan.get("text") or "")}]),
+                }
+                ok = await self.ctx.send.forward([node], sid, **common)
+            else:
+                ok = await self.ctx.send.text(str(plan.get("text") or ""), sid, **common)
+        except Exception as exc:
+            ok = False
+            primary_err = f"发送异常：{exc}"
+        else:
+            primary_err = "" if ok else "send 返回失败"
+        if ok:
+            return True, ""
+        # 回退：把可读摘要按纯文本发出去，尽量不吞内容
+        fallback = _as_str(plan.get("readable"))
+        if fallback and fallback != _as_str(plan.get("text")):
+            self.ctx.logger.debug("[麦麦转发] 复读主路径失败（%s），回退为纯文本摘要", primary_err)
+            try:
+                ok = await self.ctx.send.text(fallback, sid, **common)
+            except Exception as exc:
+                return False, f"{primary_err}；纯文本回退异常：{exc}"
+            if ok:
+                return True, ""
+        return False, primary_err
+
+    # ------------------------------------------------------------------
+    # 聊天流与当前聊天解析
+    # ------------------------------------------------------------------
+
+    async def _all_streams(self) -> list[dict]:
+        try:
+            streams = await self.ctx.chat.get_all_streams(platform=PLATFORM)
+        except Exception as exc:
+            self.ctx.logger.debug("[麦麦转发] chat.get_all_streams 异常：%s", exc)
+            return []
+        return [s for s in (streams or []) if isinstance(s, dict)]
+
+    async def _find_stream_by_id(self, stream_id: str) -> dict | None:
+        sid = _as_str(stream_id)
+        if not sid:
+            return None
+        for s in await self._all_streams():
+            if _as_str(s.get("session_id")) == sid or _as_str(s.get("stream_id")) == sid:
+                return s
+        return None
+
+    async def _resolve_target_stream(self, raw: Any) -> tuple[dict | None, str]:
+        sid = _as_str(raw)
+        if not sid:
+            return None, "目标聊天流 ID 为空"
+        stream = await self._find_stream_by_id(sid)
+        if stream:
+            return self._target_from_stream(stream), ""
+        # 兼容：LLM 直接给了群号 / QQ 号
+        if re.fullmatch(r"-?\d+", sid):
+            for method in (self.ctx.chat.get_stream_by_group_id, self.ctx.chat.get_stream_by_user_id):
+                try:
+                    found = await method(sid, platform=PLATFORM)
+                except Exception as exc:
+                    self.ctx.logger.debug("[麦麦转发] 按号查流(%s) 异常：%s", sid, exc)
+                    found = None
+                if isinstance(found, dict) and found.get("session_id"):
+                    self.ctx.logger.debug(
+                        "[麦麦转发] 目标 %s 命中聊天流 %s", sid, found.get("session_id"),
+                    )
+                    return self._target_from_stream(found), ""
+            # 最后尝试按群号打开/创建会话（机器人在群里但从未收到消息时流可能不存在）
+            try:
+                opened = await self.ctx.chat.open_session(platform=PLATFORM, chat_type="group", group_id=sid)
+                stream = opened.get("stream") if isinstance(opened, dict) else None
+                if isinstance(stream, dict) and stream.get("session_id"):
+                    self.ctx.logger.debug(
+                        "[麦麦转发] 目标 %s 已打开/创建聊天流 %s", sid, stream.get("session_id"),
+                    )
+                    return self._target_from_stream(stream), ""
+            except Exception as exc:
+                self.ctx.logger.debug("[麦麦转发] open_session(%s) 失败：%s", sid, exc)
+        return None, "找不到目标聊天流"
+
+    @staticmethod
+    def _target_from_stream(stream: dict) -> dict:
+        gid = _as_str(stream.get("group_id"))
+        is_group = bool(gid) or bool(stream.get("is_group_session")) or _as_str(stream.get("chat_type")) == "group"
+        sid = _as_str(stream.get("session_id") or stream.get("stream_id"))
+        account_id = _as_str(stream.get("account_id"))
+        if is_group:
+            return {
+                "kind": "group",
+                "id": gid or sid,
+                "stream_id": sid,
+                "group_id": gid or sid,
+                "group_name": _as_str(stream.get("group_name")) or gid or sid,
+                "user_id": "",
+                "peer_nickname": "",
+                "account_id": account_id,
+            }
+        uid = _as_str(stream.get("user_id"))
+        return {
+            "kind": "private",
+            "id": uid,
+            "stream_id": sid,
+            "group_id": "",
+            "group_name": "",
+            "user_id": uid,
+            "peer_nickname": _as_str(stream.get("user_nickname")) or uid,
+            "account_id": account_id,
+        }
+
+    async def _current_chat(self, call_kwargs: dict) -> dict:
+        """解析工具调用发生时所在的聊天。"""
+        sid = _as_str(call_kwargs.get("stream_id"))
+        msg = call_kwargs.get("message") if isinstance(call_kwargs.get("message"), dict) else None
+        if not sid and msg is not None:
+            sid = _as_str(msg.get("session_id")) or _as_str(msg.get("chat_id"))
+        stream = await self._find_stream_by_id(sid) if sid else None
+        if stream:
+            target = self._target_from_stream(stream)
+            target["known"] = True
+            return target
+        # 兜底：从触发消息 dict 推断
+        msg = msg or {}
+        group = _msg_group_info(msg)
+        user = _msg_user_info(msg)
+        gid = _as_str(group.get("group_id"))
+        uid = _as_str(user.get("user_id"))
+        account_id = _as_str(_msg_additional(msg).get("self_id"))
+        if gid:
+            t = {
+                "kind": "group", "id": gid, "stream_id": sid,
+                "group_id": gid, "group_name": _as_str(group.get("group_name")) or gid,
+                "user_id": "", "peer_nickname": "", "account_id": account_id,
+            }
+        elif sid or uid:
+            t = {
+                "kind": "private" if uid else None, "id": uid or sid or None, "stream_id": sid,
+                "group_id": "", "group_name": "", "user_id": uid,
+                "peer_nickname": _as_str(user.get("user_nickname")), "account_id": account_id,
+            }
+        else:
+            t = {
+                "kind": None, "id": None, "stream_id": sid,
+                "group_id": "", "group_name": "", "user_id": "",
+                "peer_nickname": "", "account_id": "",
+            }
+        t["known"] = bool(t.get("kind"))
+        return t
+
+    # ------------------------------------------------------------------
+    # 转发名单检查
+    # ------------------------------------------------------------------
+
+    def _permission_error(self, source: dict, target: dict) -> str:
+        """返回 ""=通过；否则返回给 LLM 的拒绝原因。
+
+        两侧分别按各自聊天类型（群聊=群号名单 / 私聊=QQ 号名单）检查：
+        - 当前聊天未通过 → 「不允许转发信息」；
+        - 目标聊天未通过 → 「不允许将信息转发到目标」；
+        - 两者都未通过 → 优先显示当前聊天的提示。
+        """
+        src_fail = self._side_check(source)
+        dst_fail = self._side_check(target)
+        if not src_fail and not dst_fail:
+            return ""
+        if src_fail:
+            kind_cn, mode_cn, cid = src_fail
+            msg = f"转发被拒绝：当前{kind_cn}（{cid}）未通过{mode_cn}检查，当前{kind_cn}不允许转发聊天记录。"
+            if dst_fail:
+                msg += f"（另外：目标{dst_fail[0]}（{dst_fail[2]}）也未通过{dst_fail[1]}检查）"
+            return msg
+        kind_cn, mode_cn, cid = dst_fail
+        return f"转发被拒绝：目标{kind_cn}（{cid}）未通过{mode_cn}检查，不允许将信息转发到目标{kind_cn}。"
+
+    def _side_check(self, side: dict) -> tuple[str, str, str] | None:
+        kind = _as_str(side.get("kind"))
+        cid = _as_str(side.get("id"))
+        if kind == "group":
+            cfg = self.config.group_permission
+        elif kind == "private":
+            cfg = self.config.private_permission
+        else:
+            self.ctx.logger.debug("[麦麦转发] 聊天类型未知或非 QQ（kind=%r），跳过名单检查", kind)
+            return None
+        if not cid:
+            self.ctx.logger.debug("[麦麦转发] 聊天（kind=%s）缺少 ID，跳过名单检查", kind)
+            return None
+        if check_permission(cfg.list_type, cfg.id_list, cid):
+            self.ctx.logger.debug(
+                "[麦麦转发] 名单检查通过：%s（%s，%s）",
+                cid, "群聊" if kind == "group" else "私聊", cfg.list_type,
+            )
+            return None
+        kind_cn = "群聊" if kind == "group" else "私聊"
+        mode_cn = "黑名单" if _as_str(cfg.list_type) == "blacklist" else "白名单"
+        return kind_cn, mode_cn, cid
+
+    # ------------------------------------------------------------------
+    # 聊天记录注入（is_notify 合成通知，只入库不真发）
+    # ------------------------------------------------------------------
+
+    async def _inject_record(self, target: dict, text: str, tool: str, meta: dict | None = None) -> tuple[bool, str]:
+        gid = _as_str(target.get("group_id"))
+        uid = _as_str(target.get("user_id"))
+        if not gid and not uid:
+            return False, "无法定位目标聊天（缺少群号/对方 QQ 号）"
+        bot = await self._bot_info(fallback_id=_as_str(target.get("account_id")))
+        message_id = f"maiforward-{tool}-{uuid.uuid4().hex[:16]}"
+        additional = {
+            "self_id": bot["user_id"] or "0",
+            "maiforward_injected": tool,
+            "maiforward_meta": dict(meta or {}),
+        }
+        if gid:
+            user_info = {
+                "user_id": bot["user_id"] or "0",
+                "user_nickname": bot["nickname"],
+                "user_cardname": None,
+            }
+            group_info: dict | None = {
+                "group_id": gid,
+                "group_name": _as_str(target.get("group_name")) or gid,
+            }
+        else:
+            # 私聊会话按对方 QQ 号定位：user_info 记为对方；
+            # 该记录由本插件合成的说明写在 additional_config 与正文前缀里。
+            user_info = {
+                "user_id": uid,
+                "user_nickname": _as_str(target.get("peer_nickname")) or uid,
+                "user_cardname": None,
+            }
+            group_info = None
+        record = {
+            "message_id": message_id,
+            "timestamp": str(time.time()),
+            "platform": PLATFORM,
+            "message_info": {
+                "user_info": user_info,
+                "group_info": group_info,
+                "additional_config": additional,
+            },
+            "raw_message": [{"type": "text", "data": text}],
+            "is_notify": True,
+            "processed_plain_text": text,
+        }
+        try:
+            resp = await self.ctx.gateway.route_message(
+                GATEWAY_NAME,
+                record,
+                route_metadata={"self_id": additional["self_id"]},
+                external_message_id=message_id,
+                dedupe_key=f"maiforward:{message_id}",
+            )
+        except Exception as exc:
+            self.ctx.logger.warning("[麦麦转发] 注入聊天记录异常：%s", exc)
+            return False, f"注入异常：{exc}"
+        if isinstance(resp, dict):
+            accepted = bool(resp.get("accepted", resp.get("success", True)))
+        else:
+            accepted = resp is not False
+        if accepted:
+            self.ctx.logger.debug(
+                "[麦麦转发] 已注入聊天记录 %s（%s）：%s", message_id, tool, _one_line(text)[:120],
+            )
+            return True, ""
+        return False, f"注入被拒绝：{resp}"
+
+    async def _bot_info(self, fallback_id: str = "") -> dict[str, str]:
+        """机器人账号信息：get_login_info 查询并缓存（不要反查历史消息取昵称）。
+
+        仅在真实查询成功时缓存；NapCat 不可用时的兜底值不缓存，下次仍会重试。
+        """
+        if self._bot_info_cache:
+            return self._bot_info_cache
+        info = {"user_id": _as_str(fallback_id), "nickname": "麦麦"}
+        ok, data, _err = await self._napcat_action("get_login_info")
+        if ok and isinstance(data, dict) and data.get("user_id"):
+            info = {
+                "user_id": _as_str(data.get("user_id")),
+                "nickname": _as_str(data.get("nickname")) or "麦麦",
+            }
+            self._bot_info_cache = info
+        else:
+            resp = None
+            try:
+                resp = await self.ctx.api.call("adapter.napcat.system.get_login_info")
+            except Exception:
+                resp = None
+            if isinstance(resp, dict) and resp.get("success") is not False and resp.get("user_id"):
+                info = {
+                    "user_id": _as_str(resp.get("user_id")),
+                    "nickname": _as_str(resp.get("nickname")) or "麦麦",
+                }
+                self._bot_info_cache = info
+        if not info["user_id"]:
+            info["user_id"] = "0"  # 兜底，保证 user_info 非空
+        return info
+
+    # ------------------------------------------------------------------
+    # NapCat 适配器调用
+    # ------------------------------------------------------------------
+
+    async def _napcat_action(self, action: str, params: dict | None = None) -> tuple[bool, Any, str]:
+        """走适配器通用 action 入口（支持负数 message_id）。返回 (ok, data, error)。"""
+        if time.time() < self._napcat_dead_until:
+            return False, None, "NapCat 适配器近期调用失败，已临时跳过"
+        try:
+            resp = await self.ctx.api.call(
+                "adapter.napcat.action.call", action_name=action, params=params or {},
+            )
+        except Exception as exc:
+            self._mark_napcat_dead(f"调用异常：{exc}")
+            return False, None, f"NapCat 适配器调用异常：{exc}"
+        if isinstance(resp, dict) and resp.get("success") is False:
+            # 宿主层失败：API 不存在 / 解析失败 / 目标插件异常
+            self._mark_napcat_dead(str(resp.get("error")))
+            return False, None, str(resp.get("error"))
+        if not isinstance(resp, dict):
+            return False, None, f"NapCat 返回格式异常：{type(resp).__name__}"
+        if resp.get("status") != "ok" and resp.get("retcode") != 0:
+            err = resp.get("wording") or resp.get("message") or resp.get("error") or resp
+            return False, None, f"action={action} 失败：{err}"
+        self._napcat_dead_until = 0.0
+        return True, resp.get("data"), ""
+
+    def _mark_napcat_dead(self, reason: str) -> None:
+        if time.time() >= self._napcat_dead_until:
+            self._napcat_dead_until = time.time() + _NAPCAT_COOLDOWN
+            self.ctx.logger.debug(
+                "[麦麦转发] NapCat 适配器暂不可用（%s），%.0f 秒内直接走宿主回退路径",
+                reason, _NAPCAT_COOLDOWN,
+            )
+
+
+def create_plugin() -> MaiForwardPlugin:
+    """Runner 加载入口。"""
+    return MaiForwardPlugin()
