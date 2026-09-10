@@ -38,7 +38,7 @@ from typing import Any, ClassVar, Literal
 from maibot_sdk import Field, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
-SUPPORTED_CONFIG_VERSION = "0.1.0"
+SUPPORTED_CONFIG_VERSION = "0.1.1"
 GATEWAY_NAME = "maiforward_recorder"
 PLATFORM = "qq"
 
@@ -54,20 +54,28 @@ _PACK_SUBDIR = "packs"   # data_dir 下存放打包记录的目录
 # ==========================================================================
 
 class _PermissionListBase(PluginConfigBase):
-    """转发名单通用结构（黑名单/白名单可切换）。"""
+    """转发名单通用结构（黑名单/白名单可切换），供群聊/私聊名单复用。"""
 
     list_type: Literal["blacklist", "whitelist"] = Field(
         default="blacklist",
         description="名单类型：blacklist=黑名单（留空=全部允许转发）；whitelist=白名单（留空=全部不启用转发）",
+        json_schema_extra={
+            "label": "名单类型",
+            "hint": "黑/白名单切换",
+        },
     )
     id_list: list[str] = Field(
         default_factory=list,
         description="名单列表；黑名单留空=全部启用转发，白名单留空=全部不启用转发",
+        json_schema_extra={
+            "label": "名单列表",
+            "hint": "名单条目一行一个",
+        },
     )
 
 
 class GroupPermissionConfig(_PermissionListBase):
-    """群聊转发名单（填 QQ 群号）。"""
+    """群聊转发名单（group_permission 配置节，填 QQ 群号）。"""
 
     __ui_label__ = "群聊转发名单（QQ 群号）"
     __ui_icon__ = "groups"
@@ -76,11 +84,15 @@ class GroupPermissionConfig(_PermissionListBase):
     id_list: list[str] = Field(
         default_factory=list,
         description="QQ 群号列表（字符串形式，如 [\"123456789\"]）",
+        json_schema_extra={
+            "label": "群聊名单列表",
+            "hint": "群号列表一行一个",
+        },
     )
 
 
 class PrivatePermissionConfig(_PermissionListBase):
-    """私聊转发名单（填 QQ 号）。"""
+    """私聊转发名单（private_permission 配置节，填 QQ 号）。"""
 
     __ui_label__ = "私聊转发名单（QQ 号）"
     __ui_icon__ = "person"
@@ -89,11 +101,15 @@ class PrivatePermissionConfig(_PermissionListBase):
     id_list: list[str] = Field(
         default_factory=list,
         description="QQ 号列表（字符串形式）",
+        json_schema_extra={
+            "label": "私聊名单列表",
+            "hint": "QQ号列表一行一个",
+        },
     )
 
 
 class ForwardSectionConfig(PluginConfigBase):
-    """转发行为配置。"""
+    """转发行为（forward 配置节）。"""
 
     __ui_label__ = "转发行为"
     __ui_icon__ = "forward"
@@ -102,49 +118,105 @@ class ForwardSectionConfig(PluginConfigBase):
     force_merge: bool = Field(
         default=True,
         description="强制合并：转发两天及以上的旧消息时忽略 LLM 传入的是否合并参数，强制合并为合并转发",
+        json_schema_extra={
+            "label": "强制合并",
+            "hint": "旧消息强制合并转发",
+        },
     )
     force_merge_age_days: float = Field(
         default=2.0,
         ge=0.0,
         description="触发强制合并的消息年龄阈值（天），默认 2 天",
+        json_schema_extra={
+            "label": "强制合并年龄阈值（天）",
+            "hint": "超过此天数触发合并",
+        },
     )
     prefer_napcat_direct: bool = Field(
         default=True,
         description="优先经 NapCat 用原始消息直接转发（引用节点/单条转发，内容零改动）；关闭后始终经宿主 send.forward 构造节点发送",
+        json_schema_extra={
+            "label": "优先 NapCat 直连",
+            "hint": "优先 NapCat 原样转发",
+        },
     )
     destroy_after_forward: bool = Field(
         default=True,
         description="分享后销毁：聊天记录包（工具1打包）被分享（工具3）一次后立即从本地数据中删除",
+        json_schema_extra={
+            "label": "分享后销毁",
+            "hint": "分享即删除记录包",
+        },
     )
     max_forward_count: int = Field(
         default=3,
         ge=1,
         description="最大分享次数：destroy_after_forward 关闭时，聊天记录包最多被分享这么多次后销毁（默认 3 次）",
+        json_schema_extra={
+            "label": "最大分享次数",
+            "hint": "记录包最大分享次数",
+        },
     )
 
 
 class PluginSectionConfig(PluginConfigBase):
-    """插件基础配置。"""
+    """插件基础配置（plugin 配置节）。"""
 
     __ui_label__ = "插件"
     __ui_icon__ = "package"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用插件")
+    enabled: bool = Field(
+        default=True,
+        description="是否启用插件",
+        json_schema_extra={
+            "label": "启用插件",
+            "hint": "插件总开关",
+        },
+    )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
         description="配置版本（与插件版本同步）",
-        json_schema_extra={"hidden": True, "disabled": True},
+        json_schema_extra={
+            "hidden": True,
+            "disabled": True,
+            "label": "配置版本",
+            "hint": "配置版本，勿改",
+        },
     )
 
 
 class MaiForwardConfig(PluginConfigBase):
     """麦麦转发完整配置。"""
 
-    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
-    group_permission: GroupPermissionConfig = Field(default_factory=GroupPermissionConfig)
-    private_permission: PrivatePermissionConfig = Field(default_factory=PrivatePermissionConfig)
-    forward: ForwardSectionConfig = Field(default_factory=ForwardSectionConfig)
+    plugin: PluginSectionConfig = Field(
+        default_factory=PluginSectionConfig,
+        json_schema_extra={
+            "label": "插件",
+            "hint": "插件基础配置",
+        },
+    )
+    group_permission: GroupPermissionConfig = Field(
+        default_factory=GroupPermissionConfig,
+        json_schema_extra={
+            "label": "群聊转发名单",
+            "hint": "群聊转发名单",
+        },
+    )
+    private_permission: PrivatePermissionConfig = Field(
+        default_factory=PrivatePermissionConfig,
+        json_schema_extra={
+            "label": "私聊转发名单",
+            "hint": "私聊转发名单",
+        },
+    )
+    forward: ForwardSectionConfig = Field(
+        default_factory=ForwardSectionConfig,
+        json_schema_extra={
+            "label": "转发行为",
+            "hint": "转发行为相关配置",
+        },
+    )
 
 
 # ==========================================================================
