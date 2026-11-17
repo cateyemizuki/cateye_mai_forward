@@ -1,123 +1,285 @@
 # 麦麦转发（MaiForward）
 
 - 插件 ID：`github.cateye.mai-forward`
+- 类型：`tool`（LLM 工具插件）
 - 作者：cateye
-- 类型：tool（LLM 工具插件）
-- 兼容宿主：MaiBot 1.0.0 ~ 1.99.99（覆盖 1.2.x 与 1.3.x；manifest 能力面在 1.2.x/1.3.0 无差异）
+- 宿主：MaiBot 1.0.0 ~ 1.99.99
+- SDK：`maibot_sdk` 2.5.0 ~ 2.99.99
+- 许可证：MIT
 
-把指定的聊天消息**按原样**打包，进行**合并转发**或**逐条转发**，并支持**复读**单条消息。消息内容一律从 NapCat / MaiBot 宿主读取，不由 LLM 转述构造，避免转发内容失真；转发到**群聊**时，发送成功后向目标群注入一条带来源标注的聊天记录（`[转发工具 源→目标]` / `[复读工具]`）；**转发/复读到私聊只真发、不入库**（不注入合成记录）。
+麦麦转发让机器人把聊天消息搬到另一个聊天：合并或逐条转发、复读单条消息，以及把若干消息打包收藏后再以合并转发分享。消息正文由插件从 NapCat 或宿主消息库读取，LLM 只负责挑选消息、指定目标和写概括，不能用自己转述的文本构造转发内容。
 
-此外支持**收藏与分享**：把 LLM 认为值得分享的聊天记录打包收藏到本地（`pack_chat_messages`，每包有唯一 `pack_id`），随时查看（`list_message_packs`），并把包以**合并转发**分享到当前聊天（`share_message_pack`），受转发名单限制、按配置销毁或限次。
+插件只注册 LLM 工具和一个只入库的 receive 网关（`maiforward_recorder`），没有斜杠命令，也没有 Hook。使用时直接对机器人提出转发、复读或收藏要求即可。
 
-## 注册的 LLM 工具
+## 工具总览
 
-### `forward_messages` — 打包转发
+| 工具 | 作用 | 是否真的发送消息 |
+| --- | --- | --- |
+| `forward_messages` | 把消息转发到指定聊天 | 是 |
+| `repeat_message` | 把一条消息复读到当前聊天 | 是 |
+| `pack_chat_messages` | 把消息打包收藏到本地 | 否 |
+| `list_message_packs` | 列出本地尚未销毁的包 | 否 |
+| `share_message_pack` | 把包以合并转发分享到当前聊天 | 是 |
+
+转发、复读、分享到**群聊**并发送成功后，插件会尝试额外注入一条以工具名标注的合成记录；**私聊**目标只真发、不入库。
+
+## 安装与依赖
+
+- 将插件目录放入 MaiBot 的 `plugins/` 下，由宿主加载入口 `create_plugin()`。
+- manifest 未声明依赖；代码只导入 `maibot_sdk` 与 Python 标准库，没有额外的 Python 包需要安装。
+- 宿主需提供 manifest 声明的能力：`send.text`、`send.emoji`、`send.hybrid`、`send.forward`、`message.get_by_id`、`chat.get_all_streams`、`chat.get_stream_by_group_id`、`chat.get_stream_by_user_id`、`chat.open_session`、`api.call`。
+- NapCat 适配器是可选的外部插件：插件通过 `adapter.napcat.action.call` 读取原始消息和直连发送，并在需要时通过 `adapter.napcat.system.get_login_info` 获取机器人账号。未安装适配器时，内容改从宿主消息记录读取、发送改走宿主接口，功能仍可用，但保真度下降（语音、视频、文件等只能以占位文本表示）。
+- 本地数据写入宿主提供的 `ctx.paths.data_dir`：包在 `packs/`，审计在 `audit.jsonl`。数据目录不可用时，打包返回 `pack_store_failed`，列包返回空列表，分享按 `pack_not_found` 处理；转发与复读仍可发送，只是审计无法写入。
+
+加载时日志会输出 `[麦麦转发] 合成记录网关 maiforward_recorder 已就绪` 和 `[麦麦转发] 已加载（强制合并=...，阈值=... 天，NapCat 直连优先=...）`。插件以 `config_model = MaiForwardConfig` 提供配置模型，字段带中文标签/提示与英文翻译，供宿主 WebUI 渲染配置页。
+
+## 使用示例
+
+对机器人说：
+
+- “把刚才这三条消息合并转发到群 123456。”
+- “复读一下上一条。”
+- “把这段对话收藏起来，回头分享到别的群。”
+- “列出收藏，把最近那个分享到本群。”
+
+## LLM 工具
+
+以下工具的参数都没有默认值：标为必填的必须由 LLM 传入，缺少或为空会取消本次调用；`list_message_packs` 没有参数。
+
+### `forward_messages`
+
+把若干条消息转发到指定聊天：可以合并成一条合并转发，也可以逐条发送。仅在用户明确要求转发聊天记录时调用。
 
 | 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `message_ids` | string[] | ✔ | 要打包的消息 ID 列表（可多个） |
-| `target_stream_id` | string | ✔ | 目标聊天流 ID（也接受目标群号 / 对方 QQ 号） |
-| `merge` | bool | ✔ | 是否合并为一条合并转发消息 |
+| --- | --- | --- | --- |
+| `message_ids` | string[] | 是 | 要转发的消息 ID 列表 |
+| `target_stream_id` | string | 是 | 目标聊天流 ID；也接受群号或对方 QQ 号 |
+| `merge` | bool | 是 | `true` 合并转发，`false` 逐条转发 |
 
-**缺少任意一个参数都会直接报错**：打印 debug 日志，并把缺少的参数、收到的原始参数、正确用法一并返回给 LLM。任一消息 ID 读不到时同样中止并逐条列出（不部分发送）。
+行为：
 
-### `repeat_message` — 复读
+- **目标解析**：先按聊天流 ID 在 `chat.get_all_streams(platform="qq")` 的结果中匹配 `session_id` / `stream_id`；未命中且传入的是纯数字时，依次按群号（`chat.get_stream_by_group_id`）、对方 QQ 号（`chat.get_stream_by_user_id`）查找已有聊天流；仍未命中时按群号调用 `chat.open_session(chat_type="group")` 尝试打开或创建会话。**私聊没有既有聊天流时，不能用 QQ 号指定目标**，需要传该私聊的聊天流 ID。
+- **参数容错**：`message_ids` 也接受逗号或空白分隔的字符串，重复 ID 会去重并保留首次出现的顺序，未传 `message_ids` 时 `message_id` 可作为单条消息的别名；目标参数接受 `target_chat_id`、`to_stream_id`、`chat_stream_id`、`target_group_id` 别名；`merge` 接受 `true/false`、`1/0`、`yes/no`、`on/off`、`是/否` 等写法，也接受 `is_merge`、`merged`、`as_merge`。
+- **条数上限**：超过 `forward.max_items_per_call`（默认 20）直接拒绝，未发送任何消息。
+- **整体成功或整体取消**：逐条读取消息，任意一条读不到就取消本次转发，`failed` 列出失败的消息及原因，不部分发送。
+- **强制合并**：`merge=false` 时，如果 `forward.force_merge` 开启且本次最早一条消息距现在已达到 `forward.force_merge_age_days`，实际按合并转发发送，并在返回中标记 `forced_merge=true`。原本就传 `merge=true` 时不额外标注。
+- **发送路径**：见「内容读取与发送」。NapCat 直连逐条发送时如果已经发出部分消息后失败，返回 `partial_send_failed`，不会回退或重发，避免重复。
+- **记录**：目标为群聊时，发送成功后会尝试注入 `[转发工具 源→目标]` 记录；「源」是发起调用的当前聊天，「目标」是目标聊天。目标为私聊时只真发，不注入记录。发送成功但没有宿主记录时写审计日志。
 
-| 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `message_id` | string | ✔ | 要复读的消息 ID |
+返回：
 
-复读在当前聊天进行；若被复读的消息来自其他聊天，视为跨聊天转发，同样受转发名单限制。复读发生在**群聊**时构造一条相同的信息入库，开头显示 `[复读工具]` 字样；发生在**私聊**时只真发、不入库。
+- 成功：`success=true`、`content`、`forwarded`（条数）、`mode`（`merged` / `single`）、`forced_merge`、`target_stream_id`、`record_injected`。
+- 失败：`success=false`、`error`（见错误码表）、`content`；按场景附带 `missing`、`failed` 或 `sent`。
 
-### `pack_chat_messages` — 打包收藏聊天记录
+### `repeat_message`
 
-| 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `message_ids` | string[] | ✔ | 要打包的消息 ID 列表（可多个） |
-| `summary` | string | ✔ | 对整个打包内容的简短概括（一句话） |
-| `description` | string | ✔ | 对整个打包内容的详细描述 |
-
-把 LLM 在聊天记录中发现的、值得分享到其他群的内容**原样**收集打包，连同概括/描述写入本地数据（`data_dir/packs/`），返回唯一 `pack_id`。打包只存本地、不发送；任一条消息读不到则整体取消。之后可用 `list_message_packs` 查看、`share_message_pack` 分享。
-
-### `list_message_packs` — 查看打包列表
-
-无参数。列出本地尚未销毁的全部包：`pack_id`、来源群/私聊、消息条数、概括与描述。**分享前先调用本工具拿到真实 `pack_id`**。
-
-### `share_message_pack` — 分享打包到当前聊天
+把一条消息在当前聊天重新发送一次。仅在用户明确要求复读某条消息时调用。
 
 | 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `pack_id` | string | ✔ | 来自 `list_message_packs` 的打包 ID |
+| --- | --- | --- | --- |
+| `message_id` | string | 是 | 要复读的消息 ID |
 
-把指定包的内容按**原样**构造为节点，以一条**合并转发**发到**当前聊天**（`storage_message=False`，群聊成功后在群记录注入 `[分享工具 源→目标]` 标注；私聊对方照常收到，但不注入合成记录——返回中会明确告知 LLM 转发已成功，只是私聊记录无法显示）。**必须先经 `list_message_packs`**：`pack_id` 必须真实存在（不存在的 ID 直接报错，防止 LLM 编造）。分享前对「包来源聊天」与「当前聊天」做双向名单检查，未通过即拒绝并说明。支持发回包原本所在的群（原地转发）。
+行为：
 
-分享成功即消耗一次；是否立即销毁/限次由配置决定（见下）。
+- 当前聊天由工具调用上下文中的 `stream_id` 或触发消息的会话信息解析；`stream_id`、群号和对方 QQ 号都取不到时返回 `unknown_current_stream`。
+- 复读目标固定为当前聊天，没有目标参数。
+- 同聊天判定按消息的 `chat_kind` 与 `chat_id`：群聊比群号；私聊比**消息发送者 QQ**（`sender_id`）与当前聊天解析出的私聊 ID（通常是对方 QQ）。两者一致时不做名单检查；不一致时视为跨聊天，检查消息来源聊天与当前聊天。机器人自己发送的私聊消息会被当作跨聊天复读。
+- 发送方式按内容形态自动选择：纯文本用 `send.text`，单个表情包用 `send.emoji`，含图片/表情包用 `send.hybrid`，含图片 URL 且没有 base64 图片/表情包时用单节点 `send.forward`，其他情况按文本发送。主路径失败且可读摘要与正文不同时，回退发送纯文本摘要。
+- 语音、视频、文件、卡片、合并转发等无法直接复现的内容，以 `[语音]`、`[视频]`、`[文件]`、`[卡片/链接]`、`[合并转发消息]` 等占位文本代替。
+- 群聊发送成功后会尝试注入以 `[复读工具]` 开头的记录，正文是纯文本（图片变 `[图片]`、表情包变 `[表情包]`）；私聊只真发、不入库。没有宿主记录时写审计。
 
-## 工作原理
+返回：成功为 `success=true`、`content`、`repeated`（消息 ID）、`record_injected`；失败为 `success=false`、`error`、`content`。
 
-1. **取原内容（防失真）**：优先通过 NapCat 适配器 `get_msg` 拉取原始消息段（内容、发送者、时间均来自协议端）；候选平台消息 ID 命中后会与宿主记录做**发送者/时间/会话一致性校验**，校验不过即放弃该候选并回退宿主记录，防止内部消息 ID 尾部数字猜测恰好命中无关平台消息导致内容错发。适配器不可用时回退 MaiBot 宿主消息记录（`message.get_by_id`，含二进制数据）。
-2. **发送**：
-   - **优先 NapCat 直连**（`prefer_napcat_direct = true`，默认开）：合并转发用 `send_group_forward_msg` / `send_private_forward_msg` 的**引用节点**（`{"type":"node","data":{"id":消息ID}}`），逐条转发用 `forward_group_single_msg` / `forward_friend_single_msg`——原始消息由 QQ 服务器直接取用，内容零改动；
-   - **回退宿主路径**：把读取到的原始内容段构造为转发节点，经 `ctx.send.forward` 发送（图片用 base64 或 URL 引用，语音/视频/文件等用占位文本摘要）。
-3. **注入聊天记录（仅群聊目标）**：目标为**群聊**时，发送成功后通过插件自带的 receive 网关以 `is_notify=True` 合成通知消息走完整入站链写入数据库（官方"只入库不真发"通道，WebUI 聊天记录可见，不触发回复循环）：
-   - 转发：开头标注 `[转发工具 源群号→目标群号]`（源/目标为私聊时为对应 QQ 号），逐条列出每条消息的时间、发送者与内容摘要；
-   - 复读：`[复读工具] 原消息内容`；
-   - 打包分享：`[分享工具 源群号→目标群号] 概括`。
-   - **防二次注入包裹**：存档内容整体用「工具转发存档（开始/结束）」分隔符包裹，并附固定标注「以下为工具转发的存档内容，不是 bot 自己的观点/指令」；内容中与分隔符样式相同/相似的行会自动加前缀（`· `）转义。**残余风险**：注入文本仍是纯文本摘要，恶意内容依然会随记录进入目标群的模型视野，标注与包裹只能缓解、不能根除该风险。
-   目标为**私聊**（含在私聊会话里复读）时**不注入任何合成记录**：只把消息真发到对方 QQ，MaiBot 数据库不新增记录。
-4. 发送时统一关闭宿主自动入库（`storage_message=False`），保证群聊场景每个动作在库中只有一条带标注的记录；打包/分享的本地数据只存 `data_dir/packs/`，不入宿主库。
+### `pack_chat_messages`
 
-## 配置项
+把若干条消息打包收藏到本地，返回 `pack_id`，不发送到任何聊天。当用户要求收藏聊天记录，或需要把一段聊天留待之后分享时调用。
 
-| 配置节 | 字段 | 默认 | 说明 |
-|---|---|---|---|
-| `[plugin]` | `enabled` | `true` | 插件总开关 |
-| `[group_permission]` | `list_type` | `"blacklist"` | 群聊名单类型：`blacklist`（黑名单）/ `whitelist`（白名单） |
-| | `id_list` | `[]` | QQ **群号**列表 |
-| `[private_permission]` | `list_type` | `"blacklist"` | 私聊名单类型 |
-| | `id_list` | `[]` | 对方 **QQ 号**列表 |
-| `[forward]` | `force_merge` | `true` | 强制合并（见下） |
-| | `force_merge_age_days` | `2.0` | 触发强制合并的消息年龄阈值（天） |
-| | `prefer_napcat_direct` | `true` | 优先 NapCat 原样直连转发 |
-| | `destroy_after_forward` | `true` | **分享后销毁**：打包记录被分享（工具3）一次后立即从本地数据删除 |
-| | `max_forward_count` | `3` | **最大分享次数**：`destroy_after_forward=false` 时，打包记录最多被分享这么多次后销毁（默认 3） |
-| | `max_items_per_call` | `20` | 单次转发/打包的最大消息条数，超过直接拒绝（防刷屏与协议端风控） |
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `message_ids` | string[] | 是 | 要打包的消息 ID 列表 |
+| `summary` | string | 是 | 一句话概括 |
+| `description` | string | 是 | 详细描述，供之后判断包的内容 |
 
-### 名单判定规则（群聊/私聊分开配置、双向检查）
+行为：
 
-- **黑名单模式**：留空 = 全部允许；填入的群号/QQ号**不允许**参与转发。
-- **白名单模式**：留空 = 全部不启用（谁都不能转发）；只有填入的群号/QQ号**允许**参与转发。
-- 转发时**源聊天与目标聊天都要通过检查**（各自按群聊/私聊名单判定）：
-  - 源未通过 → 告知 LLM「当前群/私聊不允许转发聊天记录」；
-  - 目标未通过 → 告知 LLM「不允许将信息转发到目标群/私聊」；
-  - 两者都未通过 → **优先显示当前聊天不允许转发的提示**（并附注目标同样未通过）。
-- **fail-closed**：无法识别的聊天来源（上下文缺失、非 QQ 来源等）或缺少 ID 的聊天一律**拒绝**转发/打包/分享并记录日志，不再静默放行。
-- `share_message_pack` 分享包时同样做双向检查：源 = 包的来源聊天，目标 = 当前聊天（群/私聊各按名单）。**允许原地转发**（发回包原本所在的群，双方同群，按该群名单判定）；任一侧未通过即拒绝并说明原因。
+- 只按消息 ID 读取：先经宿主库确认消息存在，内容可能来自 NapCat；不校验消息是否属于当前聊天，也**不做群聊/私聊名单检查**。在参数合法的前提下，能否打包只取决于消息 ID 是否可读。
+- 超过 `forward.max_items_per_call` 直接拒绝，未保存任何数据。
+- 任意一条消息读不到就整体取消，`failed` 列出失败项。
+- 包的来源聊天取**第一条消息**的聊天信息：群聊记群号/群名；私聊记**消息发送者 QQ**（`sender_id`），而不是会话对方。机器人自己发送的私聊消息会因此把来源记成机器人 QQ，分享时也按这个 ID 过私聊名单。
+- 生成 `pack_id`（形如 `maiforward-pack-<12 位十六进制>`），把消息快照写入 `data_dir/packs/<pack_id>.json`，`share_count` 初始为 0。
+- 快照保留转发节点段（含图片 base64 或图片 URL），之后分享不再按消息 ID 读取原消息。
 
-### 强制合并
+返回：成功为 `success=true`、`content`、`pack_id`、`packed`（条数）、`summary`；失败为 `success=false`、`error`、`content`。
 
-`force_merge = true`（默认）时，若要转发的消息中存在早于 `force_merge_age_days`（默认 2 天）的旧消息，将**忽略 LLM 传入的 `merge` 参数**，强制合并为一条合并转发消息，并在工具返回中告知 LLM 已强制合并。
+### `list_message_packs`
 
-### 打包记录生命周期（`share_message_pack`）
+无参数。列出 `data_dir/packs/` 下尚未销毁的包，按 `created_at` 倒序。
 
-- `destroy_after_forward = true`（默认）：每个包**分享成功一次后立即从本地数据删除**（`max_forward_count` 无效）。
-- `destroy_after_forward = false`：每个包可被分享多次，`share_count` 递增，达到 `max_forward_count`（默认 3）后自动销毁。
-- 分享**未成功**（名单拦截/发送失败等）不消耗次数、不销毁。
-- 本地数据位于插件 `data_dir/packs/`，跨重启保留；删除即物理移除对应 JSON 文件。
+本工具不按当前聊天或转发名单过滤：`data_dir/packs/` 下所有包（包括其他群聊或私聊来源的 `source`、`summary`、`description`）都会返回给 LLM。
 
-## 安装
+返回：
 
-1. 将本目录放入 MaiBot 安装目录的 `plugins/` 下；
-2. 重启 MaiBot，确认日志出现 `[麦麦转发]` 加载输出（本插件带 manifest 能力声明，**必须完整重启**才生效）；
-3. 运行时 `config.toml` 由 Runner 自动生成，可在 WebUI 插件管理中修改并热重载。
+- `success=true`、`content`（文本列表）、`count`、`packs`。
+- 文本列表包含 `pack_id`、来源群/私聊、消息条数、概括与描述；`packs` 数组每项包含 `pack_id`、`summary`、`description`、`source`、`message_count`、`share_count`。
+- 数据目录不存在、读取异常或单个 JSON 损坏时跳过对应条目，返回空列表或减少条目，不报错。
 
-NapCat 适配器为**可选依赖**：未安装时本插件自动走宿主回退路径（仅影响转发保真度，不影响功能可用性）。本插件不硬声明适配器依赖，按短名 `adapter.napcat.action.call` 调用并自带兜底，因此同时兼容 MaiBot 1.2.x 的 `maibot-team.napcat-adapter` 与 1.3.0 合并后的 `maibot-team.snowluma-adapter`。
+分享前先调用本工具取得真实 `pack_id`。
 
-## 注意事项
+### `share_message_pack`
 
-- 工具默认进入 deferred 池，由 Planner 通过 `tool_search` 发现；如需常驻可在工具元数据上加 `core_tool`。
-- `pack_chat_messages` / `list_message_packs` / `share_message_pack` 的本地数据保存在插件 `data_dir/packs/*.json`（跨重启保留）。若 MaiBot 未授予插件数据目录，打包会返回错误（不会静默丢失）。
-- 私聊只真发、不入库：转发/复读到私聊时不会在 MaiBot 库中新增任何记录（QQ 端照常发送）。因此不再有“私聊记录归属对方会话 / 机器人署名”的取舍问题——那条合成记录仅在群聊目标时才会写入。若未来要恢复私聊入库，须注意宿主按 `user_info.user_id` 重算 session_id（私聊会话归属由 user_id 决定），且 WebUI 的 bot/user 气泡判定只看 `user_id == 机器人账号`（`is_bot_self`）。
-- **本地审计日志**：由于私聊目标不留宿主记录（群聊注入失败时同样），插件会在 `data_dir/audit.jsonl` 以 JSONL 追加一条审计记录（时间/动作/触发者/源/目标/消息数，**不含消息内容**），仅存本地，供事后追溯。
-- 多账号部署时 NapCat 直连路径走适配器自身的连接；如需严格按会话账号路由，请设置 `prefer_napcat_direct = false`。
-- 若发现目标聊天中出现"无标注 + 有标注"两条记录，说明宿主未 honored `storage_message=False`，请反馈并检查主进程日志。
+把指定包以一条合并转发发送到当前聊天。发送目标固定为当前聊天，不能指定其他聊天。当用户要求把已打包的聊天记录分享到当前聊天时调用；`pack_id` 需来自 `list_message_packs`。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `pack_id` | string | 是 | 来自 `list_message_packs` 的包 ID |
+
+行为：
+
+- `pack_id` 必须对应 `data_dir/packs/` 中存在的包；不存在、已销毁或文件损坏时返回 `pack_not_found`。
+- 名单检查：源为包的来源聊天（私聊时是包内第一条消息的发送者 QQ），目标为当前聊天，两侧都按各自的群聊/私聊名单判定；允许把包发回它原本所在的群。
+- 发送固定走宿主 `send.forward`（`storage_message=False`），不使用 NapCat 直连，`forward.prefer_napcat_direct` 对它不生效。
+- 第一次发送失败且节点中含 `imageurl` / `emoji` 段时，把这类段替换为 `[图片]` / `[表情包]` 文本后重试一次；仍失败则返回 `send_failed`。
+- 发送成功后按配置处理包：`destroy_after_forward=true` 时立即删除；否则 `share_count` 加一，达到 `max_forward_count` 后删除。发送失败、名单拦截、包不存在、包为空都不计数。
+- 群聊目标发送成功后会尝试注入 `[分享工具 源→目标]` 记录（正文是包的概括）；私聊目标不注入，返回内容会要求 LLM 告知用户已发送成功。
+- 包的计数/删除写入失败不影响已完成的发送，结果中会提示状态更新失败。
+
+返回：成功为 `success=true`、`content`、`pack_id`、`share_count`（本次分享后的计数）、`record_injected`；失败为 `success=false`、`error`、`content`。
+
+### 工具错误码
+
+| `error` | 出现的工具 | 含义 |
+| --- | --- | --- |
+| `missing_or_invalid_parameters` | 全部带参数的工具 | 必填参数缺失或为空；`missing`（若有）列出字段 |
+| `too_many_items` | `forward_messages`、`pack_chat_messages` | 超过 `forward.max_items_per_call`，未发送或未保存 |
+| `target_stream_not_found` | `forward_messages` | 目标无法解析为聊天流 |
+| `messages_not_found` | `forward_messages`、`pack_chat_messages` | 至少一条消息读不到；`failed` 列出；整体取消 |
+| `message_not_found` | `repeat_message` | 消息读不到 |
+| `unknown_current_stream` | `repeat_message`、`share_message_pack` | 无法确定当前聊天 |
+| `permission_denied` | `forward_messages`、`repeat_message`（跨聊天）、`share_message_pack` | 名单未通过，`content` 说明哪一侧被拒 |
+| `pack_store_failed` | `pack_chat_messages` | 写 `data_dir/packs` 失败 |
+| `pack_not_found` | `share_message_pack` | 包不存在、已销毁或文件损坏 |
+| `pack_empty` | `share_message_pack` | 包内没有可发送的消息 |
+| `send_failed` | `forward_messages`、`repeat_message`、`share_message_pack` | 发送接口返回失败；`content` 含原因 |
+| `partial_send_failed` | `forward_messages` | NapCat 直连已发出部分消息后失败；`sent` 为已发条数，不重发 |
+
+工具内部异常时返回 `success=false` 与 `content`（含「插件内部异常」），不带 `error` 字段。
+
+## 内容读取与发送
+
+### 消息来源
+
+工具参数不包含消息正文，转发正文一律由插件读取：
+
+1. 先调用 `message.get_by_id(message_id, include_binary_data=True)` 从宿主消息库取消息。取不到即判定该消息读取失败，后续 NapCat 不再尝试。
+2. 消息平台为 `qq` 时，再尝试用 NapCat 的 `get_msg` 读取原始消息段。候选 ID 包括传入 ID、宿主记录里的 `message_id` / `platform_message_id` / `napcat_message_id` 等字段，以及传入 ID 末尾的数字串；命中后还要与宿主记录核对发送者、群号和消息时间（容差 300 秒），不一致就放弃该候选，继续尝试其他候选或改用宿主记录。
+3. NapCat 不可用或校验不通过时，用宿主记录的 `raw_message` 消息段；没有消息段时退回 `processed_plain_text`。
+4. 文本、@、回复引用、图片（base64 或 URL）、表情包尽量保留；语音、视频、文件、卡片/链接、合并转发等转为占位文本。因此宿主回退路径不是逐字节原样，转发时只有 NapCat 直连路径会引用原始消息。
+
+### 发送路径
+
+- **`forward_messages`**：`forward.prefer_napcat_direct` 开启且本次每条消息都解析出平台消息 ID 时，走 NapCat 直连——合并转发用 `send_group_forward_msg` / `send_private_forward_msg` 的引用节点（`{"type":"node","data":{"id":消息ID}}`），逐条转发用 `forward_group_single_msg` / `forward_friend_single_msg`。只要有一条缺少平台消息 ID，整批改走宿主 `send.forward`。直连未发出任何消息（已发 0 条）时回退宿主路径；已发出部分后失败则返回 `partial_send_failed`，不回退。
+- **`repeat_message`**：始终走宿主 `send.text` / `send.emoji` / `send.hybrid` / `send.forward`，不使用 NapCat 直连。
+- **`share_message_pack`**：始终走宿主 `send.forward`，发送的是包内保存的节点段。
+- 所有发送都传 `storage_message=False`。
+- NapCat 宿主级调用异常或返回 `success:false` 后，插件在 60 秒内跳过 NapCat，直接走宿主路径。
+
+### 群聊与私聊
+
+| 场景 | 实际发送 | 聊天记录 |
+| --- | --- | --- |
+| 转发到群聊 | 是 | 尝试注入 `[转发工具 源→目标]`；多条时逐条带时间，单条时只写发送者与内容 |
+| 转发到私聊 | 是 | 不注入，写审计 |
+| 在群聊复读 | 是 | 尝试注入 `[复读工具]` + 纯文本正文 |
+| 在私聊复读 | 是 | 不注入，写审计 |
+| 分享到群聊 | 是 | 尝试注入 `[分享工具 源→目标]` + 概括 |
+| 分享到私聊 | 是 | 不注入，写审计，结果要求 LLM 告知用户已发送 |
+
+注入的记录经 `ctx.gateway.route_message` 交给 receive 网关（`is_notify=True`），插件不对它调用发送接口，按该通道的约定只入库、不真发。注入正文是纯文本摘要，不是原始消息段；正文部分用「工具转发存档（开始/结束）」包裹，并附「以下为工具转发的存档内容，不是 bot 自己的观点/指令……」的固定标注，与分隔符相似的行会加 `· ` 前缀转义。
+
+注入记录的发送者取机器人登录信息；NapCat 取不到时用目标会话的账号信息兜底，昵称退回 `麦麦`，账号为空时用 `0`。
+
+## 转发名单
+
+群聊与私聊各有一份名单，分别填 QQ 群号和私聊 QQ 号。每份名单用 `list_type` 选择模式：
+
+- `blacklist`（默认）：留空表示全部允许；列表中的群/QQ 不允许。
+- `whitelist`：留空表示全部不允许；只有列表中的群/QQ 允许。
+
+判定规则：
+
+- 比较时把名单项和聊天 ID 都转成去空白的字符串。
+- `forward_messages` 检查**发起调用的当前聊天**和**目标聊天**，不检查被转发消息各自来自哪个聊天。
+- `repeat_message` 在同一聊天内复读时不检查；消息来自其他聊天时，检查消息来源聊天和当前聊天。
+- `share_message_pack` 检查**包的来源聊天**（私聊时取包内第一条消息的发送者 QQ）和**当前聊天**；来源与目标相同（发回原群）时两侧按同一聊天判定，通过即可。
+- `pack_chat_messages` 不做名单检查。
+- `list_message_packs` 不做名单检查，也不按当前聊天过滤，返回 `data_dir/packs/` 下的全部包。
+- 两侧都不通过时，返回内容优先说明第一侧（转发为当前聊天，跨聊天复读为消息来源，分享为包来源）未通过，并附注另一侧也未通过。
+- **fail-closed**：聊天类型无法识别（缺少群聊/私聊信息）或缺少聊天 ID 时一律拒绝，不静默放行。因此工具调用上下文必须能确定当前聊天，否则转发会被名单检查拒绝，分享会因无法确定当前聊天而取消。
+
+## 强制合并
+
+`forward.force_merge`（默认开启）控制旧消息是否强制合并：
+
+- 只作用于 `forward_messages`。
+- 以本次转发中**最早一条**消息的时间计算年龄；达到 `forward.force_merge_age_days`（默认 2 天，按 86400 秒/天）时，最终按合并转发发送，忽略 LLM 传入的 `merge=false`。
+- 只有 LLM 原本传了 `merge=false` 时才把 `forced_merge` 标为 `true` 并在返回文案中说明；原本传 `merge=true` 不额外标注。
+- 消息时间缺失时按当前时间参与计算。
+
+## 打包记录
+
+- `pack_chat_messages` 生成 `pack_id`（`maiforward-pack-<12 位十六进制>`），写入 `data_dir/packs/<pack_id>.json`。文件包含 `pack_id`、`summary`、`description`、`created_at`、`source`、`items`、`share_count`。
+- `source` 取第一条消息的聊天信息（私聊为消息发送者 QQ）；`items` 是消息快照（发送者、时间、可读摘要、转发节点段等），分享时直接使用快照，不再读取原消息。
+- 没有基于时间的过期或定时清理：包文件写入 `data_dir/packs/`，在宿主清理数据目录前会一直保留，直到分享触发销毁条件；也可以直接删除对应的 JSON 文件。
+- `forward.destroy_after_forward=true`（默认）：每次分享成功后立即删除该包，`max_forward_count` 不生效。
+- `forward.destroy_after_forward=false`：每次分享成功后 `share_count` 加一；达到 `max_forward_count`（默认 3，最小 1）时删除，否则写回文件。
+- 发送失败、名单拦截、包不存在、包为空都不消耗次数。
+- 分享已成功但删除/写回失败时，发送结果仍为成功，返回文案会提示包状态更新失败。
+- 包内可能包含图片 base64，文件体积会随消息数量和图片大小增长；包内容来自聊天记录，注意 `data_dir` 的访问权限。
+
+## 配置
+
+| 配置项 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `plugin.enabled` | bool | `true` | 配置模型中的启用字段；插件代码不读取该值，停用请使用宿主的插件管理 |
+| `plugin.config_version` | str | `"0.1.3"` | 配置版本元数据，WebUI 隐藏且禁用，代码不读取 |
+| `group_permission.list_type` | `"blacklist"` / `"whitelist"` | `"blacklist"` | 群聊名单模式 |
+| `group_permission.id_list` | string[] | `[]` | QQ 群号列表 |
+| `private_permission.list_type` | `"blacklist"` / `"whitelist"` | `"blacklist"` | 私聊名单模式 |
+| `private_permission.id_list` | string[] | `[]` | 私聊 QQ 号列表（通常为对方 QQ） |
+| `forward.force_merge` | bool | `true` | 旧消息强制合并（仅 `forward_messages`） |
+| `forward.force_merge_age_days` | float，≥ 0 | `2.0` | 强制合并阈值（天） |
+| `forward.prefer_napcat_direct` | bool | `true` | 优先 NapCat 直连（仅 `forward_messages`） |
+| `forward.destroy_after_forward` | bool | `true` | 分享成功后立即删除包 |
+| `forward.max_forward_count` | int，≥ 1 | `3` | 关闭分享后销毁时的最大分享次数 |
+| `forward.max_items_per_call` | int，≥ 1 | `20` | `forward_messages` / `pack_chat_messages` 单次条数上限 |
+
+插件不缓存配置项：每次工具调用直接读取当前配置值；`on_config_update` 只写 debug 日志，不做额外的重建或迁移。
+
+## 审计日志
+
+本地审计文件为 `data_dir/audit.jsonl`，每次发送成功但没有留下宿主聊天记录时追加一行 JSON：
+
+- 触发场景：转发/复读到私聊，或群聊注入合成记录失败；分享到私聊或群聊注入失败同样记录。
+- 字段：`time`（本地时间）、`action`（`forward` / `repeat` / `share`）、`trigger_user`（触发消息的发送者 QQ，缺失为 `未知`）、`source`、`target`、`message_count`。
+- 不记录消息内容。
+- 写入失败只记 warning，不影响已经完成的发送。
+
+## 使用注意
+
+- 三个工具会真的发消息：`forward_messages`、`repeat_message`、`share_message_pack`。`pack_chat_messages` 只写本地文件，`list_message_packs` 只读本地文件。
+- 群聊中发送成功后会尝试额外注入一条标注记录，但注入正文是纯文本摘要：图片变 `[图片]`、表情包变 `[表情包]`、语音/视频/文件/卡片变占位文本。分隔符、免责标注和转义只能降低、不能消除转发内容对宿主模型的二次提示注入风险。
+- `forward_messages` 的 `[转发工具 源→目标]` 中「源」是发起调用的当前聊天，不是每条消息各自的来源聊天；插件也不校验被转发的消息是否属于当前聊天。名单检查同样只覆盖当前聊天和目标聊天。
+- `pack_chat_messages` 不做名单检查，也不校验消息归属，只按消息 ID 读取；能拿到消息 ID 的调用方，只要该消息在宿主库中可读，就能把它打包。包文件保存消息内容快照和图片数据，且没有自动过期，请按数据敏感度管理 `data_dir`。
+- `share_message_pack` 只能发到当前聊天；分享到私聊不会留下聊天记录，结果会要求 LLM 明确告知用户发送成功。
+- 私聊消息的 `chat_id` 取**消息发送者**，不是会话对方：机器人自己发送的私聊消息会把来源记成机器人 QQ，从而影响打包来源、分享来源名单和同聊天复读判断。
+- `list_message_packs` 返回 `data_dir/packs/` 下的全部包，不按当前聊天或名单过滤；多会话部署时，其他群/私聊的来源、概括与描述也会进入 LLM 上下文。
+- 名单判定依赖工具调用上下文。上下文缺失、聊天类型或 ID 无法识别时会拒绝转发/分享；同聊天复读不受名单限制。
+- NapCat 直连通过适配器通用 action 调用，不携带账号参数；多账号部署若需要严格按会话账号发送，可关闭 `forward.prefer_napcat_direct`，统一走宿主路径。
+- 插件没有斜杠命令和 Hook，所有操作都由 LLM 工具触发。
+
+## 许可证与仓库
+
+- 许可证：MIT，见 [LICENSE](LICENSE)。
+- 版本历史：[CHANGELOG.md](CHANGELOG.md)。
+- 仓库：<https://github.com/cateyemizuki/cateye_mai_forward>
+- 问题反馈：<https://github.com/cateyemizuki/cateye_mai_forward/issues>
