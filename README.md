@@ -241,12 +241,12 @@
 | 配置项 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `plugin.enabled` | bool | `true` | 配置模型中的启用字段；插件代码不读取该值，停用请使用宿主的插件管理 |
-| `plugin.config_version` | str | `"0.1.4"` | 配置版本元数据，WebUI 隐藏且禁用，代码不读取 |
+| `plugin.config_version` | str | `"0.1.5"` | 配置版本元数据，WebUI 隐藏且禁用，代码不读取 |
 | `group_permission.list_type` | `"blacklist"` / `"whitelist"` | `"blacklist"` | 群聊名单模式 |
 | `group_permission.id_list` | string[] | `[]` | QQ 群号列表 |
 | `private_permission.list_type` | `"blacklist"` / `"whitelist"` | `"blacklist"` | 私聊名单模式 |
 | `private_permission.id_list` | string[] | `[]` | 私聊 QQ 号列表（通常为对方 QQ） |
-| `forward.record_group_history` | bool | `true` | 在 WebUI 聊天记录中补录群聊转发、复读和分享 |
+| `forward.record_group_history` | bool | `false` | 在 WebUI 聊天记录中补录群聊转发、复读和分享 |
 | `forward.force_merge` | bool | `true` | 旧消息强制合并（仅 `forward_messages`） |
 | `forward.force_merge_age_days` | float，≥ 0 | `2.0` | 强制合并阈值（天） |
 | `forward.prefer_napcat_direct` | bool | `true` | 优先 NapCat 直连（仅 `forward_messages`） |
@@ -254,7 +254,7 @@
 | `forward.max_forward_count` | int，≥ 1 | `3` | 关闭分享后销毁时的最大分享次数 |
 | `forward.max_items_per_call` | int，≥ 1 | `20` | `forward_messages` / `pack_chat_messages` 单次条数上限 |
 
-在插件配置页的「转发行为」中切换「群聊记录补录」，保存后热生效。关闭时，MaiBot 注销该插件的 QQ 补录网关。QQ 发送照常进行，发送成功后写入本地审计。重新开启时会重新注册网关。
+在插件配置页的「转发行为」中切换「群聊记录补录」，保存后热生效。此项默认关闭，更新后继续使用配置中已保存的值。关闭时，MaiBot 注销该插件的 QQ 补录网关。QQ 发送照常进行，发送成功后写入本地审计。开启时会注册网关。
 
 ## 审计日志
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.cateye.mai-forward",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "name": "麦麦转发",
   "description": "从 NapCat 或宿主消息库读取原始消息，支持转发、复读、打包收藏和分享。群聊记录补录可独立开关，支持群聊与私聊转发名单、分享后销毁和最大分享次数。",
   "author": { "name": "cateye", "url": "https://github.com/cateyemizuki" },

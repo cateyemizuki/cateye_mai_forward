@@ -41,7 +41,7 @@ from typing import Any, ClassVar, Literal
 from maibot_sdk import Field, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
-SUPPORTED_CONFIG_VERSION = "0.1.4"
+SUPPORTED_CONFIG_VERSION = "0.1.5"
 GATEWAY_NAME = "maiforward_recorder"
 PLATFORM = "qq"
 
@@ -162,7 +162,7 @@ class ForwardSectionConfig(PluginConfigBase):
     }
 
     record_group_history: bool = Field(
-        default=True,
+        default=False,
         description="转发、复读或分享成功后，在群聊中补录一条带来源标注的记录",
         json_schema_extra={
             "label": "群聊记录补录",
