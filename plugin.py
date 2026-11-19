@@ -29,6 +29,7 @@ is_notify 合成通知通道（官方「只入库不真发」通道）：写入�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -40,7 +41,7 @@ from typing import Any, ClassVar, Literal
 from maibot_sdk import Field, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
-SUPPORTED_CONFIG_VERSION = "0.1.3"
+SUPPORTED_CONFIG_VERSION = "0.1.4"
 GATEWAY_NAME = "maiforward_recorder"
 PLATFORM = "qq"
 
@@ -86,7 +87,15 @@ class _PermissionListBase(PluginConfigBase):
         json_schema_extra={
             "label": "名单类型",
             "hint": "黑/白名单切换",
-            **_ui_i18n("List mode", "Blacklist / whitelist switch"),
+            "i18n": {
+                "zh-CN": {"choice:blacklist": "黑名单", "choice:whitelist": "白名单"},
+                "en": {
+                    "label": "List mode",
+                    "hint": "Blacklist / whitelist switch",
+                    "choice:blacklist": "Blacklist",
+                    "choice:whitelist": "Whitelist",
+                },
+            },
         },
     )
     id_list: list[str] = Field(
@@ -152,6 +161,18 @@ class ForwardSectionConfig(PluginConfigBase):
         "en": {"title": "Forward behavior", "description": "How messages are forwarded and shared"},
     }
 
+    record_group_history: bool = Field(
+        default=True,
+        description="转发、复读或分享成功后，在群聊中补录一条带来源标注的记录",
+        json_schema_extra={
+            "label": "群聊记录补录",
+            "hint": "关闭后注销补录网关，照常发送 QQ 消息并保留本地审计",
+            **_ui_i18n(
+                "Record group chat history",
+                "Turn off to unregister the recording gateway while keeping QQ sends and local auditing",
+            ),
+        },
+    )
     force_merge: bool = Field(
         default=True,
         description="强制合并：转发两天及以上的旧消息时忽略 LLM 传入的是否合并参数，强制合并为合并转发",
@@ -651,6 +672,14 @@ def build_forward_record_text(src_id: str, dst_id: str, items: list[dict], merge
     return "\n".join(lines)
 
 
+def _record_result_note(injected: bool, error: str, success_note: str = "聊天记录已注入并标注来源。") -> str:
+    if injected:
+        return success_note
+    if error:
+        return f"注意：聊天记录注入失败（{error}）。"
+    return "群聊记录补录已关闭。"
+
+
 # ==========================================================================
 # 插件主体
 # ==========================================================================
@@ -668,6 +697,9 @@ class MaiForwardPlugin(MaiBotPlugin):
         super().__init__(*args, **kwargs)
         self._bot_info_cache = None
         self._napcat_dead_until = 0.0
+        self._record_gateway_lock = asyncio.Lock()
+        self._record_gateway_state: bool | None = False
+        self._unloading = False
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -676,9 +708,9 @@ class MaiForwardPlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         self._bot_info_cache = None
         self._napcat_dead_until = 0.0
+        self._unloading = False
         try:
-            await self.ctx.gateway.update_state(GATEWAY_NAME, ready=True, platform=PLATFORM)
-            self.ctx.logger.info("[麦麦转发] 合成记录网关 %s 已就绪", GATEWAY_NAME)
+            await self._sync_record_gateway()
         except Exception as exc:
             self.ctx.logger.error("[麦麦转发] 网关就绪上报失败：%s", exc)
         fw = self.config.forward
@@ -688,17 +720,30 @@ class MaiForwardPlugin(MaiBotPlugin):
         )
 
     async def on_unload(self) -> None:
+        self._unloading = True
         try:
-            await self.ctx.gateway.update_state(GATEWAY_NAME, ready=False, platform=PLATFORM)
+            await self._sync_record_gateway()
         except Exception as exc:
             self.ctx.logger.warning("[麦麦转发] 网关离线上报失败：%s", exc)
         self.ctx.logger.info("[麦麦转发] 已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
-        self.ctx.logger.debug(
-            "[麦麦转发] 配置已更新 scope=%s version=%s（运行时直接读 self.config，无需额外处理）",
-            scope, version,
-        )
+        if scope == "self":
+            await self._sync_record_gateway()
+
+    async def _sync_record_gateway(self) -> None:
+        async with self._record_gateway_lock:
+            ready = self.config.forward.record_group_history and not self._unloading
+            if self._record_gateway_state == ready:
+                return
+            # RPC 失败时远端状态未知，后续同步需要重新确认。
+            self._record_gateway_state = None
+            if not await self.ctx.gateway.update_state(GATEWAY_NAME, ready=ready, platform=PLATFORM):
+                action = "注册" if ready else "注销"
+                raise RuntimeError(f"宿主未确认{action}群聊记录补录网关")
+            self._record_gateway_state = ready
+            status = "已就绪" if ready else "已注销"
+            self.ctx.logger.info("[麦麦转发] 合成记录网关 %s %s", GATEWAY_NAME, status)
 
     # ------------------------------------------------------------------
     # 合成记录注入网关（只入库不真发的官方通道）
@@ -731,7 +776,7 @@ class MaiForwardPlugin(MaiBotPlugin):
             "- 消息内容自动从 NapCat/宿主数据库原样读取转发，无需也不能自行转述内容；\n"
             "- 群聊/私聊分别有转发名单（黑/白名单）限制，未通过时返回具体原因；\n"
             "- 开启「强制合并」时，转发两天及以上的旧消息会忽略 merge 参数并强制合并；\n"
-            "- 转发到**群聊**成功后会在目标群的聊天记录中标注 [转发工具 源→目标]；\n"
+            "- 转发到**群聊**成功且补录开启时，会在目标群的聊天记录中标注 [转发工具 源→目标]；\n"
             "- 转发到**私聊**只把消息真发到对方 QQ，不写入 MaiBot 聊天记录（不入库）。"
         ),
         parameters=[
@@ -916,7 +961,7 @@ class MaiForwardPlugin(MaiBotPlugin):
                 {"from": src_id, "to": dst_id, "mode": "merged" if merged else "single",
                  "message_ids": ids, "send_path": send_path},
             )
-            record_note = "聊天记录已注入并标注来源。" if injected else f"注意：聊天记录注入失败（{inject_err}）。"
+            record_note = _record_result_note(injected, inject_err)
         else:
             injected, inject_err = False, "私聊只转发不入库"
             record_note = ""
@@ -947,7 +992,7 @@ class MaiForwardPlugin(MaiBotPlugin):
         brief_description="复读指定消息（按原样重新发送）",
         detailed_description=(
             "复读一条消息：把该消息按原样（文本/图片/表情包等）在当前聊天重新发送一次，"
-            "随后若在群聊中会在聊天记录写入一条以 [复读工具] 开头的记录；在私聊中只真发不入库。\n"
+            "若在群聊中且群聊记录补录已开启，会写入一条以 [复读工具] 开头的聊天记录。\n"
             "仅在用户明确要求复读某条消息时调用。\n"
             "参数（必填，缺少会直接报错并取消本次调用）：\n"
             "- message_id：要复读的消息 ID（麦麦聊天记录中的消息 ID）"
@@ -1028,7 +1073,7 @@ class MaiForwardPlugin(MaiBotPlugin):
                 current, record_text, "repeat",
                 {"message_id": mid, "origin_chat": f"{info['chat_kind']}:{info['chat_id']}"},
             )
-            record_note = "聊天记录已注入并标注 [复读工具]。" if injected else f"注意：聊天记录注入失败（{inject_err}）。"
+            record_note = _record_result_note(injected, inject_err, "聊天记录已注入并标注 [复读工具]。")
         else:
             injected, inject_err = False, "私聊只转发不入库"
             record_note = ""
@@ -1338,7 +1383,7 @@ class MaiForwardPlugin(MaiBotPlugin):
                 {"from": src_id, "to": dst_id, "pack_id": pid,
                  "summary": record.get("summary"), "share_count": record.get("share_count", 0)},
             )
-            record_note = "聊天记录已注入并标注来源。" if injected else f"注意：聊天记录注入失败（{inject_err}）。"
+            record_note = _record_result_note(injected, inject_err)
         else:
             # 私聊目标：真发成功但不注入（私聊不入库）；明确告知 LLM 已转发成功
             injected, inject_err = False, "私聊只转发不入库"
@@ -2076,6 +2121,8 @@ class MaiForwardPlugin(MaiBotPlugin):
     # ------------------------------------------------------------------
 
     async def _inject_record(self, target: dict, text: str, tool: str, meta: dict | None = None) -> tuple[bool, str]:
+        if not self.config.forward.record_group_history or self._unloading:
+            return False, ""
         gid = _as_str(target.get("group_id"))
         uid = _as_str(target.get("user_id"))
         if not gid and not uid:
@@ -2126,13 +2173,18 @@ class MaiForwardPlugin(MaiBotPlugin):
             "processed_plain_text": text,
         }
         try:
-            resp = await self.ctx.gateway.route_message(
-                GATEWAY_NAME,
-                record,
-                route_metadata={"self_id": additional["self_id"]},
-                external_message_id=message_id,
-                dedupe_key=f"maiforward:{message_id}",
-            )
+            async with self._record_gateway_lock:
+                if not self.config.forward.record_group_history or self._unloading:
+                    return False, ""
+                if not self._record_gateway_state:
+                    return False, "合成记录网关未就绪"
+                resp = await self.ctx.gateway.route_message(
+                    GATEWAY_NAME,
+                    record,
+                    route_metadata={"self_id": additional["self_id"]},
+                    external_message_id=message_id,
+                    dedupe_key=f"maiforward:{message_id}",
+                )
         except Exception as exc:
             self.ctx.logger.warning("[麦麦转发] 注入聊天记录异常：%s", exc)
             return False, f"注入异常：{exc}"

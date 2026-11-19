@@ -3,13 +3,13 @@
 - 插件 ID：`github.cateye.mai-forward`
 - 类型：`tool`（LLM 工具插件）
 - 作者：cateye
-- 宿主：MaiBot 1.0.0 ~ 1.99.99
+- 宿主：MaiBot 1.0.0 ~ 1.4.99
 - SDK：`maibot_sdk` 2.5.0 ~ 2.99.99
 - 许可证：MIT
 
 麦麦转发让机器人把聊天消息搬到另一个聊天：合并或逐条转发、复读单条消息，以及把若干消息打包收藏后再以合并转发分享。消息正文由插件从 NapCat 或宿主消息库读取，LLM 只负责挑选消息、指定目标和写概括，不能用自己转述的文本构造转发内容。
 
-插件只注册 LLM 工具和一个只入库的 receive 网关（`maiforward_recorder`），没有斜杠命令，也没有 Hook。使用时直接对机器人提出转发、复读或收藏要求即可。
+直接对机器人提出转发、复读或收藏要求即可。群聊记录补录启用时，插件会注册用于入库的接收网关 `maiforward_recorder`。
 
 ## 工具总览
 
@@ -21,7 +21,7 @@
 | `list_message_packs` | 列出本地尚未销毁的包 | 否 |
 | `share_message_pack` | 把包以合并转发分享到当前聊天 | 是 |
 
-转发、复读、分享到**群聊**并发送成功后，插件会尝试额外注入一条以工具名标注的合成记录；**私聊**目标只真发、不入库。
+启用「群聊记录补录」时，转发、复读或分享到**群聊**成功后会尝试补录一条以工具名标注的记录。**私聊**发送记入本地审计。
 
 ## 安装与依赖
 
@@ -31,7 +31,7 @@
 - NapCat 适配器是可选的外部插件：插件通过 `adapter.napcat.action.call` 读取原始消息和直连发送，并在需要时通过 `adapter.napcat.system.get_login_info` 获取机器人账号。未安装适配器时，内容改从宿主消息记录读取、发送改走宿主接口，功能仍可用，但保真度下降（语音、视频、文件等只能以占位文本表示）。
 - 本地数据写入宿主提供的 `ctx.paths.data_dir`：包在 `packs/`，审计在 `audit.jsonl`。数据目录不可用时，打包返回 `pack_store_failed`，列包返回空列表，分享按 `pack_not_found` 处理；转发与复读仍可发送，只是审计无法写入。
 
-加载时日志会输出 `[麦麦转发] 合成记录网关 maiforward_recorder 已就绪` 和 `[麦麦转发] 已加载（强制合并=...，阈值=... 天，NapCat 直连优先=...）`。插件以 `config_model = MaiForwardConfig` 提供配置模型，字段带中文标签/提示与英文翻译，供宿主 WebUI 渲染配置页。
+补录网关注册和注销成功后，日志分别显示「已就绪」和「已注销」。
 
 ## 使用示例
 
@@ -241,11 +241,12 @@
 | 配置项 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `plugin.enabled` | bool | `true` | 配置模型中的启用字段；插件代码不读取该值，停用请使用宿主的插件管理 |
-| `plugin.config_version` | str | `"0.1.3"` | 配置版本元数据，WebUI 隐藏且禁用，代码不读取 |
+| `plugin.config_version` | str | `"0.1.4"` | 配置版本元数据，WebUI 隐藏且禁用，代码不读取 |
 | `group_permission.list_type` | `"blacklist"` / `"whitelist"` | `"blacklist"` | 群聊名单模式 |
 | `group_permission.id_list` | string[] | `[]` | QQ 群号列表 |
 | `private_permission.list_type` | `"blacklist"` / `"whitelist"` | `"blacklist"` | 私聊名单模式 |
 | `private_permission.id_list` | string[] | `[]` | 私聊 QQ 号列表（通常为对方 QQ） |
+| `forward.record_group_history` | bool | `true` | 在 WebUI 聊天记录中补录群聊转发、复读和分享 |
 | `forward.force_merge` | bool | `true` | 旧消息强制合并（仅 `forward_messages`） |
 | `forward.force_merge_age_days` | float，≥ 0 | `2.0` | 强制合并阈值（天） |
 | `forward.prefer_napcat_direct` | bool | `true` | 优先 NapCat 直连（仅 `forward_messages`） |
@@ -253,13 +254,13 @@
 | `forward.max_forward_count` | int，≥ 1 | `3` | 关闭分享后销毁时的最大分享次数 |
 | `forward.max_items_per_call` | int，≥ 1 | `20` | `forward_messages` / `pack_chat_messages` 单次条数上限 |
 
-插件不缓存配置项：每次工具调用直接读取当前配置值；`on_config_update` 只写 debug 日志，不做额外的重建或迁移。
+在插件配置页的「转发行为」中切换「群聊记录补录」，保存后热生效。关闭时，MaiBot 注销该插件的 QQ 补录网关。QQ 发送照常进行，发送成功后写入本地审计。重新开启时会重新注册网关。
 
 ## 审计日志
 
 本地审计文件为 `data_dir/audit.jsonl`，每次发送成功但没有留下宿主聊天记录时追加一行 JSON：
 
-- 触发场景：转发/复读到私聊，或群聊注入合成记录失败；分享到私聊或群聊注入失败同样记录。
+- 转发、复读或分享到私聊时会写审计。群聊补录关闭或失败时同样记录。
 - 字段：`time`（本地时间）、`action`（`forward` / `repeat` / `share`）、`trigger_user`（触发消息的发送者 QQ，缺失为 `未知`）、`source`、`target`、`message_count`。
 - 不记录消息内容。
 - 写入失败只记 warning，不影响已经完成的发送。
